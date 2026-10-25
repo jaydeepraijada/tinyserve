@@ -53,7 +53,7 @@ class Config:
 
     model: str
     dtype: torch.dtype = torch.bfloat16 # bfloat16 inference by default
-    max_model_len: str = 4096 # max prompt + output we accept
+    max_model_len: int = 4096 # max prompt + output we accept
     attention_backend: str = "flash_attn" # "flash_attn" (fast) | "torch" (reference)
 
     # toks per kv-cache page. 0 = pick for backend, flash-attn only supports
@@ -171,6 +171,227 @@ class KVCacheManager:
 
         #given this prefix hash, where is its kv data (hash -> physical block) ?
         self.hash_to_block: dict[int, int] = {} 
+
+@property
+def num_free(self):
+    return len(self.free)
+
+def _update_hashes(self, req):
+
+    bs = self.block_size
+    while len(req.block_hashes) < req.num_tokens // bs:
+        i = len(req.block_hashes)
+        parent = req.block_hashes[-1] if req.block_hashes else None
+        req.block_hashes.append(
+            hash(
+                (parent, tuple(req.token_ids[i * bs: (i + 1) * bs]))
+            )
+        )
+def find_cached_prefix(self, req):
+
+    if not self.enable_caching:
+        return []
+
+    self._update_hashes(req)
+
+    # num_token = 8 (8-1)//4 == 1
+    max_blocks = (req.num_tokens - 1) // self.block_size
+
+    hits = []
+    for h in req.block_hashes[:max_blocks]:
+        b = self.hash_to_block.get(h)
+        if b is None:
+            break
+        hits.append(b)
+
+    return hits
+
+# This is  
+def allocate(self, req, num_new_tokens, cached):
+
+    total = (
+        req.num_computed_tokens 
+        + len(cached) * self.block_size
+        + num_new_tokens
+    )
+
+    total_needed_blocks = -(-total // self.block_size)
+
+    need = total_needed_blocks - len(req.block_ids) - len(cached)
+    reclaim = sum(1 for b in cached if self.ref_cnt[b] == 0)
+
+    if need + reclaim > self.num_free:
+        return False
+
+    # claim the cached blocks
+    for b in cached:
+
+        if self.ref_cnt[b] == 0:
+            del self.free[b]
+
+        self.ref_cnt[b] += 1
+        req.block_ids.append(b)
+
+    # now we allocate new blocks
+
+    for _ in range(max(need, 0)):
+        b, _ = self.free.popitem(last = False) # gives the first item
+
+        if self.block_hash[b] is not None:
+            self.hash_to_block.pop(self.block_hash[b], None)
+            self.block_hash[b] = None
+
+        self.ref_cnt[b] = 1
+        req.block_ids.append(b)
+
+    self._register_full_blocks(req, total)
+    return True
+
+def _register_full_blocks(self, req, num_tokens):
+    if not self.enable_caching:
+        return 
+
+    self._update_hashes(req)
+
+    for i in range(min(num_tokens, req.num_tokens)// self.block_size):
+        b, h = req.block_ids[i], req.block_hashes[i]
+
+        if self.block_hash[b] is None:
+            self.block_hash[b] = h
+            self.hash_to_block.setdefault(h,b)
+
+def free_request(self, req):
+    for b in reversed(req.block_ids):
+        if self.ref_cnt[b] == 0:
+            self.free[b] == None
+    req.block_ids = []
+
+
+@dataclass
+class SchduledRequest:
+    req: Request # the live request
+    num_computed: int # KV present before this forward pass
+    num_new: int # how many tokens this forward will process
+
+    @property
+    def complete_prompt(self):
+        """
+        True: This step reaches the end of the current sequence (finish prefill or decode). 
+        The sampled next token is real and we append it.
+
+        False: chunked prefill stops mid prompt, you still run those tokens to write KV, but 
+        the last positions sampled token is junk and we throw it away, the next step continues the prompt
+
+        num_tokens here is len(token_ids) which during prefill is just the prompt,
+        after a real sample, the scheduler's caller appends a token, so next step num_tokens grows by 1 and decode
+        is num_new = 1
+        """
+
+        return self.num_computed + self.num_new >= self.req.num_tokens
+
+
+class Scheduler:
+
+    def __init__(self, cfg, kv):
+
+        self.cfg = cfg
+        self.kv = kv
+        self.waiting = deque()
+        self.running = []
+
+    def add(self, req):
+        self.waiting.append(req)
+
+    def has_work(self):
+        return bool(self.waiting or self.running)
+
+    def schedule(self):
+
+        budget = self.cfg.max_num_batched_tokens
+
+        # for each request id, how many tokens will we run this step?
+        plan = {}
+
+        # if we evict anyone don't admit new work
+        preempted = False
+
+        # running requests
+        i = 0
+
+        while i < len(self.running) and budget > 0:
+
+            # what request?
+            req = self.running[i]
+
+            n = min(req.num_tokens - req.num_computed_token, budget)
+
+            while not self.kv.allocate(req, n):
+                # A B C -> A B | C (C is the victim)
+                victim = self.running.pop()
+
+                self.kv.free_request(victim)
+                victim = num_computed_tokens = 0
+                self.waiting.appendleft(victim)
+                budget += plan.pop(victim.request_id, 0)
+                preempted = True
+
+                if victim is req:
+                    break
+
+            if req not in self.running:
+                break
+
+            plan[req.request_id] = n
+            budget -= n
+            i +=1 
+
+        # currently waiting request
+        while(not preempted and self.waiting and budget > 0 and len(self.running) < self.cfg.max_num_seqs):
+            req = self.waiting[0]
+
+            cached = self.kv.find_cached_prefix(req)
+            n = min(req.num_tokens - len(cached) * self.cfg.block_size, budget)
+
+            if not self.kv.allocate(req, n, cached):
+                break
+
+            self.waiting.popleft()
+
+            req.num_computed_tokens = len(cached) * self.cfg.block_size
+            req.num_cached_tokens = max(req.num_cached_tokens, req.num_computed_tokens)
+
+            self.running.append(req)
+
+            plan[req.request_id] = n
+            budget -= n
+
+        # emit the batch in running order
+        batch = []
+        for req in self.running:
+            if req.request_id in plan:
+                batch.append(SchduledRequest(
+                    req, req.num_computed_tokens, plan[req.request_id]
+                ))
+        return batch
+
+    def finish(self, req: Request, reason: str) -> None:
+        req.finished, req.finish_reason = True, reason
+        if req in self.running:
+            self.running.remove(req)
+        elif req in self.waiting:
+            self.waiting.remove(req)
+        self.kv.free_request(req)
+        
+
+
+
+
+
+
+
+     
+
+
 
 
 
