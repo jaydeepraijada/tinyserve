@@ -557,6 +557,77 @@ def attention_demo():
         
 
 
+def kv_cache_demo():
+    """
+    Walk the scheduler + KV cache manager through chunked prefill, prefix sharing,
+    LRU reuse of freed blocks and preemption. Pure bookkeeping: no model, no GPU.
+
+    "Sampling" just appends a fake token, so we can watch the blocks move around
+    """
+    cfg = Config(model="none", attention_backend="torch", block_size=4,
+                 max_num_batched_tokens=8, max_num_seqs=4)
+    kv = KVCacheManager(num_blocks=10, block_size=cfg.block_size, enable_caching=True)
+    sched = Scheduler(cfg, kv)
+    reqs = {}
+    next_tok = [1000] # fake sampled token ids
+
+    def show(title):
+        print(f"\n== {title}")
+        for r in reqs.values():
+            state = "finished" if r.finished else "running" if r in sched.running else "waiting"
+            print(f"  {r.request_id}: {state:8s} tokens={r.num_tokens:2d} computed={r.num_computed_tokens:2d} "
+                  f"cached={r.num_cached_tokens:2d} blocks={r.block_ids}")
+        used = {b: c for b, c in enumerate(kv.ref_cnt) if c}
+        print(f"  free={kv.num_free} ref_cnt={used} free_list(LRU first)={list(kv.free)}")
+
+    def step(title):
+        # what the engine does each step: schedule, "run the model", update requests
+        batch = sched.schedule()
+        for s in batch:
+            s.req.num_computed_tokens += s.num_new
+            if s.complete_prompt: # a real sampled token, append it
+                s.req.token_ids.append(next_tok[0])
+                next_tok[0] += 1
+        plan = ", ".join(f"{s.req.request_id}+{s.num_new}" for s in batch)
+        show(f"{title}  [batch: {plan}]")
+
+    def add(rid, prompt):
+        reqs[rid] = Request(rid, prompt, SamplingParams())
+        sched.add(reqs[rid])
+
+    system = list(range(8)) # an 8 token "system prompt" = 2 full blocks
+    print(f"block_size={cfg.block_size}, 9 usable blocks (block 0 is the null block), "
+          f"token budget={cfg.max_num_batched_tokens}/step")
+
+    # 1. chunked prefill: a 12 token prompt doesn't fit in an 8 token budget
+    add("A", system + [50, 51, 52, 53])
+    step("step 1: A's prompt is chunked, first 8 tokens")
+    step("step 2: A finishes prefill (4 tokens) and samples its first token")
+
+    # 2. prefix sharing: B starts with the same system prompt
+    add("B", system + [60, 61, 62])
+    step("step 3: B reuses A's 2 system prompt blocks (ref_cnt=2), only prefills 3 tokens")
+
+    # 3. LRU reuse: when A finishes its blocks go to the free list but keep their hashes
+    sched.finish(reqs["A"], "stop")
+    show("A finished: shared blocks drop to ref_cnt=1, A's own block is free but still cached")
+    add("C", system + [50, 51, 52, 53, 54])
+    step("step 4: C extends A's prompt, so it pulls A's freed block 3 back off the free list")
+
+    # 4. preemption: keep decoding until the cache runs out
+    for i in range(5, 30):
+        before = list(sched.waiting)
+        step(f"step {i}: decode")
+        if any(r not in before for r in sched.waiting):
+            print(f"  -> out of blocks: the newest request was preempted back to waiting,"
+                  f" its blocks freed and its progress reset")
+            break
+
+    # 5. B finishes, C gets readmitted and its full blocks are still cached
+    sched.finish(reqs["B"], "stop")
+    step(f"step {i + 1}: B finished, C is readmitted and only recomputes its uncached tail")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("command", choices=["serve", "generate", "kv-demo", "attn-demo", "bench"])
