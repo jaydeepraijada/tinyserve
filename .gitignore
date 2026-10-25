@@ -1,1 +1,4 @@
 plan.txt
+
+.venv/
+__pycache__/

@@ -1,0 +1,13 @@
+torch
+numpy
+pandas
+transformers
+huggingface_hub
+safetensors
+datasets
+fastapi
+uvicorn
+
+# Optional: faster attention on CUDA GPUs (falls back to pure torch if missing).
+# Install separately after torch: pip install flash-attn --no-build-isolation
+# flash-attn
