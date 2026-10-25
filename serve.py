@@ -382,6 +382,164 @@ class Scheduler:
         elif req in self.waiting:
             self.waiting.remove(req)
         self.kv.free_request(req)
+
+@dataclass
+class AttnMetadata:
+    slot_mapping: torch.Tensor #T
+    query_start_loc: torch.Tensor # [B + 1]
+    cu_seqlens_k: torch.Tensor
+    block_table: torch.Tensor # [B x max_blocks]
+    num_seqs: int
+    max_query_len: int
+    max_seq_len: int
+    query_start_loc_cpu: list[int]
+    seq_lens_cpu: list[int]
+
+def torch_ref_attention(q, # T x H x D
+                        k_cache, # [n_pages x bs x Hkv x D]
+                        v_cache, # [n_pages x bs x Hkv x D]
+                        meta, # query_start_loc, seq_lens, block_table
+                        scale # 1/sqrt(D)
+                        ):
+    out = torch.empty_like(q)
+
+    # H = query heads, Hkv = KV heads (GQA if H > Hkv), bs = page size
+    H, Hkv, bs = q.shape[1], k_cache.shape[2], k_cache.shape[1]
+
+    # qsl[i]:qsl[i+1] = this request's slice of packed q
+    # seq_lens[i] = full context length after this step (kv_len)
+    qsl, seq_lens = meta.query_start_loc_cpu, meta.seq_lens_cpu
+
+    for i in range(meta.num_seqs):
+        s, e, kv_len = qsl[i], qsl[i+1], seq_lens[i]
+        q_len = e - s 
+
+        blocks = meta.block_table[i, : -(-kv_len//bs)].long()
+
+        # k_cache[blocks] -> [16 x Hkv x D]
+        k = k_cache[blocks].flatten(0,1)[:kv_len]
+        v = v_cache[blocks].flatten(0,1)[:kv_len]
+
+        k = k.transpose(0, 1).repeat_interleave(H // Hkv, 0)
+        v = v.transpose(0, 1).repeat_interleave(H // Hkv, 0)
+
+
+        # full prefill: q_len == kv_len -> square causal mask
+        # chunked_prefill: q_len < kv_len -> suffix strip
+        # decode: q_len == 1 -> 1 row, all keys 
+        q_pos = torch.arange(kv_len - q_len, kv_len, device = q.device)
+        mask = torch.arange(kv_len, device = q.device)[None, :] <= q_pos[:, None]
+
+        o = F.scaled_dot_product_attention(
+            q[s:e].transpose(0, 1), k, v, attn_mask=mask, scale = scale
+        )
+
+        out[s:e] = o.transpose(0,1)
+
+    return out 
+
+def flash_attention(q, k_cache, v_cache, meta, scale):
+
+    """
+    identical to the torch_ref but using flash_attn
+    """
+
+    return flash_attn_varlen_func(
+        q, k_cache, v_cache,
+        cu_seqlens_q = meta.query_start_loc, cu_seqlens_k = meta.cu_seqlens_k,
+        max_seqlen_q = meta.max_query_len, max_seqlen_k = meta.max_seq_len,
+        softmax_scale = scale, causal = True, block_table = meta.block_table
+    )
+
+### Some global variables for selecting attention
+ATTENTION_BACKENDS = {'flash_attn': flash_attention, "torch": torch_ref_attention}
+ATTN_META: AttnMetadata | None = None
+ATTN_FN = flash_attention
+
+
+def attention_demo():
+    """
+    Check paged attention against plain dense attention on random data, no model needed.
+
+    One batch mixes all three cases the engine produces:
+    full prefill (q_len == kv_len), chunked prefill (q_len < kv_len) and decode (q_len == 1)
+    """
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    torch.manual_seed(0)
+
+    H, Hkv, D = 8, 2, 64 # 8 query heads sharing 2 kv heads (GQA)
+    scale = D ** -0.5
+    cases = [("prefill", 37, 37), ("chunked", 20, 50), ("decode", 1, 70)] # (name, q_len, kv_len)
+
+    backends = [("torch", 16, torch.float32)]
+    if FLASH_ATTN_AVAILABLE and device == "cuda":
+        backends.append(("flash_attn", 256, torch.bfloat16)) # flash needs pages of 256
+
+    for backend, bs, dtype in backends:
+        num_pages = 1 + sum(-(-kv_len // bs) for _, _, kv_len in cases) # +1 for the null block 0
+        k_cache = torch.zeros(num_pages, bs, Hkv, D, device=device, dtype=dtype)
+        v_cache = torch.zeros_like(k_cache)
+
+        # hand out pages in shuffled order so each sequence is scattered across the cache
+        free_pages = (torch.randperm(num_pages - 1) + 1).tolist()
+        max_blocks = max(-(-kv_len // bs) for _, _, kv_len in cases)
+        block_table = torch.zeros(len(cases), max_blocks, dtype=torch.int32)
+
+        qs, ks, vs, slots = [], [], [], []
+        for i, (_, q_len, kv_len) in enumerate(cases):
+            pages = [free_pages.pop() for _ in range(-(-kv_len // bs))]
+            block_table[i, :len(pages)] = torch.tensor(pages, dtype=torch.int32)
+
+            k = torch.randn(kv_len, Hkv, D, device=device, dtype=dtype)
+            v = torch.randn(kv_len, Hkv, D, device=device, dtype=dtype)
+            for pos in range(kv_len): # token pos lives in page pos // bs, offset pos % bs
+                k_cache[pages[pos // bs], pos % bs] = k[pos]
+                v_cache[pages[pos // bs], pos % bs] = v[pos]
+
+            qs.append(torch.randn(q_len, H, D, device=device, dtype=dtype))
+            ks.append(k)
+            vs.append(v)
+            slots += [pages[pos // bs] * bs + pos % bs for pos in range(kv_len - q_len, kv_len)]
+
+        q_lens = [q_len for _, q_len, _ in cases]
+        seq_lens = [kv_len for _, _, kv_len in cases]
+        qsl = [0]
+        for n in q_lens:
+            qsl.append(qsl[-1] + n)
+        cu_k = [0]
+        for n in seq_lens:
+            cu_k.append(cu_k[-1] + n)
+
+        meta = AttnMetadata(
+            slot_mapping=torch.tensor(slots, device=device),
+            query_start_loc=torch.tensor(qsl, dtype=torch.int32, device=device),
+            cu_seqlens_k=torch.tensor(cu_k, dtype=torch.int32, device=device),
+            block_table=block_table.to(device),
+            num_seqs=len(cases),
+            max_query_len=max(q_lens),
+            max_seq_len=max(seq_lens),
+            query_start_loc_cpu=qsl,
+            seq_lens_cpu=seq_lens,
+        )
+
+        q = torch.cat(qs)
+        out = ATTENTION_BACKENDS[backend](q, k_cache, v_cache, meta, scale)
+
+        print(f"[attn-demo] backend={backend} device={device} page_size={bs} dtype={dtype}")
+        for i, (name, q_len, kv_len) in enumerate(cases):
+            # dense reference: the query at position p sees keys 0..p
+            k = ks[i].float().transpose(0, 1).repeat_interleave(H // Hkv, 0)
+            v = vs[i].float().transpose(0, 1).repeat_interleave(H // Hkv, 0)
+            scores = qs[i].float().transpose(0, 1) @ k.transpose(1, 2) * scale
+            q_pos = torch.arange(kv_len - q_len, kv_len, device=device)
+            causal = torch.arange(kv_len, device=device)[None, :] <= q_pos[:, None]
+            ref = (scores.masked_fill(~causal, float("-inf")).softmax(-1) @ v).transpose(0, 1)
+
+            err = (out[qsl[i]:qsl[i + 1]].float() - ref).abs().max().item()
+            tol = 2e-2 if dtype == torch.bfloat16 else 1e-4
+            print(f"  {name:8s} q_len={q_len:3d} kv_len={kv_len:3d}  max_err={err:.2e}  "
+                  f"{'OK' if err < tol else 'MISMATCH'}")
+
         
 
 
@@ -434,27 +592,27 @@ def main():
     if a.command == "attn-demo":     # needs a GPU, but no model weights
         attention_demo()
         return
-    if a.command == "bench":         # tinyserve vs HF static batching, offline
-        benchmark(a)
-        return
+    # if a.command == "bench":         # tinyserve vs HF static batching, offline
+    #     benchmark(a)
+    #     return
 
-    cfg = Config(model=a.model, attention_backend=a.attention_backend,
-                 max_model_len=a.max_model_len, max_num_seqs=a.max_num_seqs,
-                 max_num_batched_tokens=a.max_num_batched_tokens,
-                 gpu_memory_utilization=a.gpu_memory_utilization,
-                 use_cuda_graphs=not a.no_cuda_graphs,
-                 enable_prefix_caching=not a.no_prefix_caching)
-    engine = Engine(cfg)
-    if a.command == "generate":
-        out = engine.generate([a.prompt], SamplingParams(temperature=a.temperature,
-                                                         max_tokens=a.max_tokens))[0]
-        print(a.prompt + out.text)
-        return
+    # cfg = Config(model=a.model, attention_backend=a.attention_backend,
+    #              max_model_len=a.max_model_len, max_num_seqs=a.max_num_seqs,
+    #              max_num_batched_tokens=a.max_num_batched_tokens,
+    #              gpu_memory_utilization=a.gpu_memory_utilization,
+    #              use_cuda_graphs=not a.no_cuda_graphs,
+    #              enable_prefix_caching=not a.no_prefix_caching)
+    # engine = Engine(cfg)
+    # if a.command == "generate":
+    #     out = engine.generate([a.prompt], SamplingParams(temperature=a.temperature,
+    #                                                      max_tokens=a.max_tokens))[0]
+    #     print(a.prompt + out.text)
+    #     return
     
-    import uvicorn
-    print(f"[tinyserve] serving {a.model} on http://localhost:{a.port}")
-    uvicorn.run(build_app(AsyncEngine(engine), a.model), host="0.0.0.0", port=a.port,
-                log_level="warning")
+    # import uvicorn
+    # print(f"[tinyserve] serving {a.model} on http://localhost:{a.port}")
+    # uvicorn.run(build_app(AsyncEngine(engine), a.model), host="0.0.0.0", port=a.port,
+    #             log_level="warning")
 
 
 if __name__ == "__main__":
