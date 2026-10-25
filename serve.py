@@ -172,103 +172,104 @@ class KVCacheManager:
         #given this prefix hash, where is its kv data (hash -> physical block) ?
         self.hash_to_block: dict[int, int] = {} 
 
-@property
-def num_free(self):
-    return len(self.free)
+    @property
+    def num_free(self):
+        return len(self.free)
 
-def _update_hashes(self, req):
+    def _update_hashes(self, req):
 
-    bs = self.block_size
-    while len(req.block_hashes) < req.num_tokens // bs:
-        i = len(req.block_hashes)
-        parent = req.block_hashes[-1] if req.block_hashes else None
-        req.block_hashes.append(
-            hash(
-                (parent, tuple(req.token_ids[i * bs: (i + 1) * bs]))
+        bs = self.block_size
+        while len(req.block_hashes) < req.num_tokens // bs:
+            i = len(req.block_hashes)
+            parent = req.block_hashes[-1] if req.block_hashes else None
+            req.block_hashes.append(
+                hash(
+                    (parent, tuple(req.token_ids[i * bs: (i + 1) * bs]))
+                )
             )
+    def find_cached_prefix(self, req):
+
+        if not self.enable_caching:
+            return []
+
+        self._update_hashes(req)
+
+        # num_token = 8 (8-1)//4 == 1
+        max_blocks = (req.num_tokens - 1) // self.block_size
+
+        hits = []
+        for h in req.block_hashes[:max_blocks]:
+            b = self.hash_to_block.get(h)
+            if b is None:
+                break
+            hits.append(b)
+
+        return hits
+
+    # This is  
+    def allocate(self, req, num_new_tokens, cached=()):
+
+        total = (
+            req.num_computed_tokens 
+            + len(cached) * self.block_size
+            + num_new_tokens
         )
-def find_cached_prefix(self, req):
 
-    if not self.enable_caching:
-        return []
+        total_needed_blocks = -(-total // self.block_size)
 
-    self._update_hashes(req)
+        need = total_needed_blocks - len(req.block_ids) - len(cached)
+        reclaim = sum(1 for b in cached if self.ref_cnt[b] == 0)
 
-    # num_token = 8 (8-1)//4 == 1
-    max_blocks = (req.num_tokens - 1) // self.block_size
+        if need + reclaim > self.num_free:
+            return False
 
-    hits = []
-    for h in req.block_hashes[:max_blocks]:
-        b = self.hash_to_block.get(h)
-        if b is None:
-            break
-        hits.append(b)
+        # claim the cached blocks
+        for b in cached:
 
-    return hits
+            if self.ref_cnt[b] == 0:
+                del self.free[b]
 
-# This is  
-def allocate(self, req, num_new_tokens, cached):
+            self.ref_cnt[b] += 1
+            req.block_ids.append(b)
 
-    total = (
-        req.num_computed_tokens 
-        + len(cached) * self.block_size
-        + num_new_tokens
-    )
+        # now we allocate new blocks
 
-    total_needed_blocks = -(-total // self.block_size)
+        for _ in range(max(need, 0)):
+            b, _ = self.free.popitem(last = False) # gives the first item
 
-    need = total_needed_blocks - len(req.block_ids) - len(cached)
-    reclaim = sum(1 for b in cached if self.ref_cnt[b] == 0)
+            if self.block_hash[b] is not None:
+                self.hash_to_block.pop(self.block_hash[b], None)
+                self.block_hash[b] = None
 
-    if need + reclaim > self.num_free:
-        return False
+            self.ref_cnt[b] = 1
+            req.block_ids.append(b)
 
-    # claim the cached blocks
-    for b in cached:
+        self._register_full_blocks(req, total)
+        return True
 
-        if self.ref_cnt[b] == 0:
-            del self.free[b]
+    def _register_full_blocks(self, req, num_tokens):
+        if not self.enable_caching:
+            return 
 
-        self.ref_cnt[b] += 1
-        req.block_ids.append(b)
+        self._update_hashes(req)
 
-    # now we allocate new blocks
+        for i in range(min(num_tokens, req.num_tokens)// self.block_size):
+            b, h = req.block_ids[i], req.block_hashes[i]
 
-    for _ in range(max(need, 0)):
-        b, _ = self.free.popitem(last = False) # gives the first item
+            if self.block_hash[b] is None:
+                self.block_hash[b] = h
+                self.hash_to_block.setdefault(h,b)
 
-        if self.block_hash[b] is not None:
-            self.hash_to_block.pop(self.block_hash[b], None)
-            self.block_hash[b] = None
-
-        self.ref_cnt[b] = 1
-        req.block_ids.append(b)
-
-    self._register_full_blocks(req, total)
-    return True
-
-def _register_full_blocks(self, req, num_tokens):
-    if not self.enable_caching:
-        return 
-
-    self._update_hashes(req)
-
-    for i in range(min(num_tokens, req.num_tokens)// self.block_size):
-        b, h = req.block_ids[i], req.block_hashes[i]
-
-        if self.block_hash[b] is None:
-            self.block_hash[b] = h
-            self.hash_to_block.setdefault(h,b)
-
-def free_request(self, req):
-    for b in reversed(req.block_ids):
-        if self.ref_cnt[b] == 0:
-            self.free[b] == None
-    req.block_ids = []
+    def free_request(self, req):
+        for b in reversed(req.block_ids):
+            self.ref_cnt[b] -= 1
+            if self.ref_cnt[b] == 0:
+                self.free[b] = None
+        req.block_ids = []
 
 
 @dataclass
-class SchduledRequest:
+class ScheduledRequest:
     req: Request # the live request
     num_computed: int # KV present before this forward pass
     num_new: int # how many tokens this forward will process
@@ -323,14 +324,14 @@ class Scheduler:
             # what request?
             req = self.running[i]
 
-            n = min(req.num_tokens - req.num_computed_token, budget)
+            n = min(req.num_tokens - req.num_computed_tokens, budget)
 
             while not self.kv.allocate(req, n):
                 # A B C -> A B | C (C is the victim)
                 victim = self.running.pop()
 
                 self.kv.free_request(victim)
-                victim = num_computed_tokens = 0
+                victim.num_computed_tokens = 0
                 self.waiting.appendleft(victim)
                 budget += plan.pop(victim.request_id, 0)
                 preempted = True
@@ -369,7 +370,7 @@ class Scheduler:
         batch = []
         for req in self.running:
             if req.request_id in plan:
-                batch.append(SchduledRequest(
+                batch.append(ScheduledRequest(
                     req, req.num_computed_tokens, plan[req.request_id]
                 ))
         return batch
