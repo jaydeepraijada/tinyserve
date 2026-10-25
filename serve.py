@@ -457,6 +457,545 @@ ATTN_META: AttnMetadata | None = None
 ATTN_FN = flash_attention
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x):
+        xf = x.float()
+        return (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) \
+                                 + self.eps) * self.weight.float()).to(x.dtype)
+    
+def rotary(x, cos, sin):
+    x1, x2 = x.float().chunk(2, dim=-1)
+    cos, sin = cos[:, None], sin[:, None]
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], -1).to(x.dtype)
+
+class Attention(nn.Module):
+    def __init__(self, cfg, layer_idx: int):
+        super().__init__()
+        self.H = cfg.num_attention_heads
+        self.Hkv = cfg.num_key_value_heads
+        self.D = getattr(cfg, "head_dim", None) or cfg.hidden_size // self.H
+
+        ### qwen2 hardcodes true, but other models (llama, qwen3) expose attention_bias in config
+        qkv_bias = getattr(cfg, "attention_bias", False) or cfg.model_type == "qwen2"
+        self.q_proj = nn.Linear(cfg.hidden_size, self.H * self.D, bias=qkv_bias)
+        self.k_proj = nn.Linear(cfg.hidden_size, self.Hkv * self.D, bias=qkv_bias)
+        self.v_proj = nn.Linear(cfg.hidden_size, self.Hkv * self.D, bias=qkv_bias)
+        self.o_proj = nn.Linear(self.H * self.D, cfg.hidden_size, bias=False)
+
+        self.qk_norm = cfg.model_type == "qwen3"  # Qwen3 normalizes q and k per head
+        if self.qk_norm:
+            self.q_norm = RMSNorm(self.D, cfg.rms_norm_eps)
+            self.k_norm = RMSNorm(self.D, cfg.rms_norm_eps)
+
+        self.layer_idx = layer_idx
+        self.kv_cache: torch.Tensor | None = None  # [2, num_blocks, block_size, Hkv, D]
+
+    def forward(self, x, cos, sin):
+        T = x.shape[0] # x is passed in as packed
+
+        q = self.q_proj(x).view(T, self.H, self.D)
+        k = self.k_proj(x).view(T, self.Hkv, self.D)
+        v = self.v_proj(x).view(T, self.Hkv, self.D)
+
+        if self.qk_norm:
+            q, k = self.q_norm(q), self.k_norm(k)
+
+        q, k = rotary(q, cos, sin), rotary(k, cos, sin)
+
+        meta = ATTN_META # read from global
+
+        if meta is None:  # profiling run: shapes only
+            return self.o_proj(q.reshape(T, -1) * 0)
+
+        # Write this step's new K/V into the page pool before attention.
+        # k[:n] is packed [T, Hkv, D] in the same order as q.
+        # slot_mapping[t] = page * block_size + offset for that token.
+        # view(-1, Hkv, D) flattens (page, offset) onto dim 0 so
+        #   cache.view(...)[slot] == cache[page, offset]
+        # index_copy_(0, ...) does cache_flat[slot_mapping[t]] = k[t]
+        # for every new token at once. Prefix pages not in slot_mapping
+        # are left as-is.
+        k_cache, v_cache = self.kv_cache[0], self.kv_cache[1]
+        n = meta.slot_mapping.shape[0]
+        k_cache.view(-1, self.Hkv, self.D).index_copy_(0, meta.slot_mapping, k[:n])
+        v_cache.view(-1, self.Hkv, self.D).index_copy_(0, meta.slot_mapping, v[:n])
+
+        # attend over each request's whole context through its block table
+        out = ATTN_FN(q[:n], k_cache, v_cache, meta, self.D ** -0.5)
+
+        return self.o_proj(out.reshape(n, -1))
+
+### WRITE THE REST OF THE DECODER LAYER 
+class MLP(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.gate_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
+
+    def forward(self, x):
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+class DecoderLayer(nn.Module):
+    def __init__(self, cfg, i):
+        super().__init__()
+        self.self_attn = Attention(cfg, i)
+        self.mlp = MLP(cfg)
+        self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
+
+    def forward(self, x, cos, sin):
+        x = x + self.self_attn(self.input_layernorm(x), cos, sin)
+        return x + self.mlp(self.post_attention_layernorm(x))
+
+### WRITE THE MODEL
+class Model(nn.Module):
+    def __init__(self, cfg, max_position: int):
+        super().__init__()
+
+        self.cfg = cfg
+        self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+
+        self.layers = nn.ModuleList(DecoderLayer(cfg, i) for i in range(cfg.num_hidden_layers))
+        self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
+        self.tie = getattr(cfg, "tie_word_embeddings", False)
+
+        if not self.tie:
+            self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+
+        # RoPE table indexed by absolute position
+        rope = getattr(cfg, "rope_parameters", None) or getattr(cfg, "rope_scaling", None) or {}
+        assert rope.get("rope_type", "default") == "default", "only plain RoPE in this tutorial"
+        
+        theta = getattr(cfg, "rope_theta", None) or rope.get("rope_theta", 10000.0)
+        D = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
+
+        inv_freq = 1.0 / theta ** (torch.arange(0, D, 2, dtype=torch.float64) / D)
+        freqs = torch.outer(torch.arange(max_position, dtype=torch.float64), inv_freq)
+        self.register_buffer("cos", freqs.cos().float(), persistent=False)
+        self.register_buffer("sin", freqs.sin().float(), persistent=False)
+
+    def forward(self, input_ids, positions):
+        cos, sin = self.cos[positions], self.sin[positions]
+        x = self.embed_tokens(input_ids)
+        for layer in self.layers:
+            x = layer(x, cos, sin)
+        return self.norm(x)
+
+    def logits(self, hidden):
+        w = self.embed_tokens.weight if self.tie else self.lm_head.weight
+        return (hidden @ w.t()).float()
+
+def load_model(name: str, dtype, max_position: int):
+    """quick helper method to load weights into our model"""
+    path = name if os.path.isdir(name) else snapshot_download(
+        name, allow_patterns=["*.json", "*.safetensors", "tokenizer*", "*.txt"])
+    cfg = AutoConfig.from_pretrained(path)
+    torch.set_default_dtype(dtype)
+    with torch.device("cuda"):
+        model = Model(cfg, max_position)
+    torch.set_default_dtype(torch.float32)
+    params = dict(model.named_parameters())
+    with torch.no_grad():
+        for f in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
+            with safe_open(f, "pt", device="cuda") as fh:
+                for key in fh.keys():
+                    name_ = key.removeprefix("model.")
+                    if name_ in params:
+                        params[name_].copy_(fh.get_tensor(key))
+    return model.eval()
+
+### SAMPLER ###
+def sample(logits, params: SamplingParams):
+    """One batched call for mixed sampling settings.
+
+    logits: [B, V]  next-token logits, one row per request that produced
+                    a real sample this step (completes_prompt).
+    params: length B, per-request temperature / top_k / top_p.
+    """
+    greedy = logits.argmax(-1)
+
+    # if temp is 0 we assume greedy decode
+    if all(p.temperature == 0 for p in params):
+        return greedy.tolist()
+
+    # what gpu
+    dev = logits.device
+
+    # Per-row temperature. temp==0 would divide by 0, so those rows use 1.0
+    # here and get overwritten by greedy at the end via is_greedy.
+    temp = torch.tensor([p.temperature or 1.0 for p in params], device=dev)
+    logits = logits / temp[:, None] # [B, V]  higher temp -> flatter distribution
+
+    # get vocab size
+    V = logits.shape[-1]
+
+    # top_k <= 0 means "off" -> keep the whole vocab for that row.
+    top_k = torch.tensor([p.top_k if p.top_k > 0 else V for p in params], device=dev)
+    top_p = torch.tensor([p.top_p for p in params], device=dev)
+
+    # sort from largest to smallest logit (most to least likely), topk is a prefix
+    # of the row, idx[b, r] is the original vocab_id of the rth loargest logit
+    # so we can backtrack
+    sorted_logits, idx = logits.sort(-1, descending=True)
+
+    # ranks is 0 to V-1, where 0 cooresponds to the largest logit
+    ranks = torch.arange(V, device=dev)[None, :]
+
+    # get the probs themselves
+    probs = sorted_logits.softmax(-1)
+
+    # drop a sorted position if it fails topk or topp
+    # ranks >= topk: keeps only the k largest (per row)
+    # cumsum(p) - p > top_p, this token starts after the cumulative prob
+    #                        has already reached top_p
+    drop = (ranks >= top_k[:, None]) | (probs.cumsum(-1) - probs > top_p[:, None])
+    sorted_logits = sorted_logits.masked_fill(drop, float("-inf"))
+
+    # Scatter filtered logits back to vocab order, then softmax again. But now that 
+    # dropped positions are -inf, they no longer contribute to the probs in softmax
+    probs = torch.empty_like(logits).scatter_(-1, idx, sorted_logits).softmax(-1)
+
+    # Gumbel-max: argmax(log p + Gumbel(0,1)) ~ Categorical(p).
+    # G = -log Exp(1), so argmax(p / Exp(1)) is the same thing.
+    gumbel = -torch.empty_like(probs).exponential_().log()
+    sampled = (probs.log() + gumbel).argmax(-1)
+
+    # if we wanted some samples to be greedy decode we replace that here
+    is_greedy = torch.tensor([p.temperature == 0 for p in params], device=dev)
+    
+    return torch.where(is_greedy, greedy, sampled).tolist()
+
+
+### MAIN RUNNER ###
+class ModelRunner:
+    """
+    Turst the schedulers decisions into GPU tensors and runs the model
+
+    For example, assume we have a block_size of 16A is decoding at position 37 with blocks
+    [7, 3, 12], B is a new 5-token prompt with block [5]:
+        input_ids       [a37, b0, b1, b2, b3, b4]   one flat batch, no padding
+        positions       [37, 0, 1, 2, 3, 4]
+        query_start_loc [0, 1, 6]                   request i = rows qsl[i]:qsl[i+1]
+        seq_lens        [38, 5]                     how far each request attends
+        block_table     [[7, 3, 12], [5, 0, 0]]
+        slot_mapping    [197, 80, 81, 82, 83, 84]   12*16 + 37%16 = 197
+        logits rows     [0, 5]                      last token of each request
+
+    Additionally, we will leverage Cuda Graphs. The decode step of a smaller model is
+    hundreds of tiny kernels, and launching them from Python costs more than running them, 
+    we record the decode forward once per batch size into a CUDA graph and replay 
+    it with a single call. Graphs bake in memory addresses, so all inputs live in a 
+    persistent buffer that we overwrite each step, and batches are padded upto the 
+    captured size (padding requests point at null block 0). Only decode batches are
+    captured, their attention shape is fixed. Prefix (or chunked prefix) runs eagerly
+    for simplicity 
+    """
+
+    def __init__(self, cfg):
+
+        self.cfg = cfg
+        torch.manual_seed(cfg.seed)
+
+        # load the model
+        self.model = load_model(cfg.model, cfg.dtype, cfg.max_model_len)
+
+        # get the model config
+        mc = self.model.cfg
+
+        # Get metadata
+        self.H, self.Hkv = mc.num_attention_heads, mc.num_key_value_heads
+        self.D = getattr(mc, "head_dim", None) or mc.hidden_size // self.H
+        self.num_layers = mc.num_hidden_layers
+
+        # set global var for attention
+        global ATTN_FN
+        ATTN_FN = ATTENTION_BACKENDS[cfg.attention_backend]
+
+        # set max blocks per sequence (if our model supports lens upto 1024, and our
+        # block size is 256, we can have at most 4 blocks)
+        self.max_blocks_per_seq = -(-cfg.max_model_len // cfg.block_size)
+
+        # Build persistent buffers for cuda graphs
+        N, S = cfg.max_num_batched_tokens, cfg.max_num_seqs
+
+        # helper method to create an input with a given shape
+        z = lambda *shape, dt=torch.int32: torch.zeros(*shape, dtype=dt, device="cuda")
+
+        # create some dummy inputs to act as our buffers
+        self.input_ids, self.positions = z(N, dt=torch.int64), z(N, dt=torch.int64)
+        self.slot_mapping = z(N, dt=torch.int64)
+        self.query_start_loc, self.cu_seqlens_k = z(S + 1), z(S + 1)
+        self.block_table = z(S, self.max_blocks_per_seq)
+
+        # Place to store graphs
+        self.graphs: dict[int, tuple[torch.cuda.CUDAGraph, torch.Tensor]] = {}
+
+    @torch.inference_mode()
+    def allocate_kv_cache(self):
+        """
+        Run the largest possible batch without a cache, measure peak memory 
+        create by the activations and intermediate computations and give
+        the rest to KV (upto the set gpu_memory_utilization)
+        """
+
+        # Ensure our ATTN_META is just None for now
+        global ATTN_META
+        ATTN_META = None
+
+        # reset stats
+        torch.cuda.reset_peak_memory_stats()
+
+        # Measure the high-water mark of weights + activations + workspace
+        # for the largest packed step we will ever run.
+        n = self.cfg.max_num_batched_tokens
+        h = self.model(self.input_ids[:n], self.positions[:n])
+
+        # Logits path sized for a full decode batch (one row per seq slot).
+        self.model.logits(h[: self.cfg.max_num_seqs]).softmax(-1)
+
+        # drop the tensor, peak already recorded
+        del h
+
+        # total = whole GPU
+        # free = unused right now
+        # reserved = PyTorch caching allocator arena
+        # other = bytes held by someone else (or untracked)
+        peak = torch.cuda.max_memory_allocated()
+        free, total = torch.cuda.mem_get_info()
+        other = total - free - torch.cuda.memory_reserved()
+
+        # Leave (1 - gpu_memory_utilization) headroom, don't steal other,
+        # and keep peak free so the next real forward still fits beside the cache.
+        budget = total * self.cfg.gpu_memory_utilization - other - peak
+
+        # Bytes for one page id across every layer:
+        #   2 (K and V) * L * tokens/page * Hkv * D * 2 bytes (fp16/bf16)
+        bytes_per_block = 2 * self.num_layers * self.cfg.block_size * self.Hkv * self.D * 2
+
+        # Fit as many pages as the budget allows, but never more than
+        # "every seq slot filled to max_model_len" plus page 0 (the null page).
+        num_blocks = min(int(budget // bytes_per_block),
+                         self.cfg.max_num_seqs * self.max_blocks_per_seq + 1)
+
+        # After reserving page 0, the pool must still hold one max-length sequence.
+        assert (num_blocks - 1) * self.cfg.block_size >= self.cfg.max_model_len, \
+            "not enough GPU memory for even one max_model_len sequence"
+
+        # One tensor per layer: [K|V, page, offset, kv_head, dim].
+        # Same page-id space in every layer, so one block_table serves all of them.
+        for layer in self.model.layers:
+            layer.self_attn.kv_cache = torch.zeros(
+                2, num_blocks, self.cfg.block_size, self.Hkv, self.D,
+                dtype=self.cfg.dtype, device="cuda")
+
+        print(f"[tinyserve] KV cache: {num_blocks} blocks x {self.cfg.block_size} tokens = "
+              f"{num_blocks * self.cfg.block_size:,} tokens "
+              f"({num_blocks * bytes_per_block / 2**30:.1f} GB)")
+        
+        return num_blocks
+
+    def _prepare(self, batch: list[ScheduledRequest], pad_to: int = 0, for_graph: bool = False):
+        """
+        
+        Pack this step into the persistent buffers the model / graphs read.
+
+        Builds packed input_ids, positions, slot_mapping, query_start_loc,
+        cu_seqlens_k, block_table, and AttnMetadata. Addresses of those
+        buffers never change, which is what lets a CUDA graph replay.
+
+        A decode batch is "how many live requests each produce one new
+        token this step":
+
+            A already has 40 tokens -> run token 41
+            B already has 12 tokens -> run token 13
+            C already has  7 tokens -> run token  8
+
+            num_new = 1 for each
+            T = 3
+            q = [qA, qB, qC]          packed
+            kv_len = 41, 13, 8        each attends over its own prefix
+
+        Next step, if all three still run, T=3 again. A graph captured at
+        batch size 4 serves this by adding one dummy row.
+
+        pad_to > len(batch):
+            Decode graphs are captured at a fixed batch size (T == B == pad_to,
+            q_len == 1). A live decode batch smaller than that is padded with
+            dummy 1-token requests: token 0, position 0, slot 0 (the null
+            page). Their attention is ignored, logit_rows only lists real
+            requests. Without this pad, T would change every step and the
+            captured graph would be the wrong shape.
+
+        Prefill / mixed batches (some num_new > 1) call this with pad_to=0
+        and for_graph=False. T is the real token count and the forward
+        runs eager. Graphs are decode-only because only then is T a
+        function of batch size alone. One prefill chunk of 20 next to two
+        decodes would make T=22 and miss the decode graph.
+        """
+        bs = self.cfg.block_size
+
+        # packed streams we will copy onto the gpu buffers
+        ids, pos, slots, logit_rows = [], [], [], []
+        qsl, seq_lens = [0], [] # qsl starts at 0; we append the rest
+
+        # page table for real + dummy rows
+        bt = np.zeros((max(len(batch), pad_to), self.max_blocks_per_seq), dtype=np.int32)
+
+        # prepare batches (each sample in the batch is one of the ScheduledRequest)
+        for i, s in enumerate(batch):
+            start, n = s.num_computed, s.num_new          # already-have-KV, this-step queries
+            p = np.arange(start, start + n)               # absolute positions = q_pos
+            blocks = np.asarray(s.req.block_ids)          # what are these requests block_ids
+
+            # pack together each batch into a single stream
+            ids.extend(s.req.token_ids[start:start + n])  # packed input ids
+            # position embeds restart from 0 for every sample
+            pos.extend(p.tolist())                        # RoPE / causal positions
+
+            # slot = page * bs + offset, destination of index_copy_ for each new token
+            slots.extend((blocks[p // bs] * bs + p % bs).tolist())
+
+            qsl.append(qsl[-1] + n)                       # request i owns q[qsl[i]:qsl[i+1]]
+            seq_lens.append(start + n)                    # kv_len after this step's write
+            bt[i, : len(blocks)] = blocks                 # page-table row
+            logit_rows.append(qsl[-1] - 1)                # last packed row -> sample logits here
+
+        # Dummy decode reqeuests so T and B match the captured graph, 
+        # slot 0 writes into the null page, outputs are never sampled
+        # when doing graph capture, we dont pass in data, just padding
+        # so all our q_len = 1 for all cases, which is the case of our
+        # deocding anyway, so our graph capture will optimize the decoding 
+        # cases for us
+        for _ in range(len(batch), pad_to):
+            ids.append(0), pos.append(0), slots.append(0)
+            qsl.append(qsl[-1] + 1), seq_lens.append(1)
+
+        T, B = len(ids), len(seq_lens)
+
+        # persistent buffers: fixed addresses for CUDA graphs
+        self.input_ids[:T].copy_(torch.tensor(ids))
+        self.positions[:T].copy_(torch.tensor(pos))
+        self.slot_mapping[:T].copy_(torch.tensor(slots))
+        self.query_start_loc[: B + 1].copy_(torch.tensor(qsl))
+        self.cu_seqlens_k[: B + 1].copy_(torch.tensor([0] + np.cumsum(seq_lens).tolist()))
+        self.block_table[:B].copy_(torch.from_numpy(bt))
+
+        # build the attn metadata
+        max_seq = self.cfg.max_model_len if for_graph else max(seq_lens)
+
+        meta = AttnMetadata(
+            self.slot_mapping[:T],
+            self.query_start_loc[: B + 1],
+            self.cu_seqlens_k[: B + 1],
+            self.block_table[:B],
+            B,
+            max(s.num_new for s in batch) if batch else 1,  # max_query_len
+            max_seq,
+            qsl, seq_lens,                                  # host copies for torch_ref
+        )
+        return T, meta, logit_rows
+
+    @torch.inference_mode()
+    def graph_sizes(self):
+        # decode graph bucket sizes. Finegrained at bottom (1, 2, 4)
+        # where small batches are common, then every 8 upto max_num_seqs, 
+        # a live batch of N picks the smallest bucket >= N and pads the
+        # rest with dummy 1 token requests on the null page
+        sizes = [1, 2, 4] + list(range(8, self.cfg.max_num_seqs + 1, 8))
+        return [s for s in sizes if s <= self.cfg.max_num_seqs]
+
+    @torch.inference_mode()
+    def capture_cuda_graphs(self):
+        """
+        A CUDA graph records kernel launches, and the exact buffer
+        addresses they use, not the python call. Replay is just to fire 
+        that list of kernels on those buffers again. 
+
+        When running an op though, the very first call typically has more 
+        overhead (like a cuBLAS workspace for this GEMM, scratch memory
+        to store operation outputs, etc...) The second call just reuses those
+        though, so we always run a single dummy call for that initial allocation
+        followed up by capturing the second call. 
+        """
+        global ATTN_META
+        t = time.time()
+
+        # One workspace pool for every graph. Separate pools would each reserve
+        # their own peak activation slab, sharing means we pay about max(peaks) 
+        # rather than the sum of all our peaks
+        pool = torch.cuda.graph_pool_handle()
+
+        # Largest first, the first capture allocates the worst case scenario pool
+        # and smaller graphs attach to that pool instead of growing it
+        for bsz in reversed(self.graph_sizes()):
+
+            # No real requests, pad_to=bsz dummy decode rows (q_len=1, slot 0).
+            # T = B = bsz is now a compile-time constant for this graph.
+            # for_graph=True bakes max_seq_len = max_model_len into metadata.
+            T, meta, _ = self._prepare([], pad_to=bsz, for_graph=True)
+            ATTN_META = meta
+
+            # Warm-up on the same persistent buffers the graph will use.
+            # Pays every lazy workspace alloc for this (T, B, max_seqlen).
+            self.model(self.input_ids[:T], self.positions[:T])
+
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, pool=pool):
+                # Recording: kernels only. input_ids / positions / ATTN_META
+                # slices are captured by address. Next step we copy_ new
+                # tokens into that same storage and replay.
+                out = self.model(self.input_ids[:T], self.positions[:T])
+
+            # output is the captured output buffer, replay overwrites it in place
+            self.graphs[bsz] = (g, out)
+
+        print(f"[tinyserve] captured {len(self.graphs)} decode CUDA graphs in {time.time() - t:.1f}s")
+
+    @torch.inference_mode()
+    def run(self, batch: list[ScheduledRequest]) -> tuple[list[int], torch.Tensor]:
+        global ATTN_META
+
+        # Graphs are decode-only. q_len is always 1 and T == bucket size.
+        # A prefill chunk (num_new > 1) changes T every step. we don't
+        # capture a graph per (T, B) pair, so those go eager.
+        is_decode = all(s.num_new == 1 for s in batch)
+
+        # Smallest bucket that fits this batch. None if N > every captured size
+        # shouldn't happen if graph_sizes covers max_num_seqs.
+        size = next((s for s in self.graph_sizes() if s >= len(batch)), None)
+
+        # if we are decode only we can use cuda graph
+        if self.graphs and is_decode and size is not None:
+            # Pad to the captured shape. Real rows first, dummy decode rows
+            # after. Dummies write slot 0 (null page) and are not in rows.
+            T, ATTN_META, rows = self._prepare(batch, pad_to=size, for_graph=True)
+            graph, out = self.graphs[size]
+            graph.replay()                 # one launch, no allocs, same addresses
+            hidden = out                   # the buffer captured above
+        else:
+            T, ATTN_META, rows = self._prepare(batch)   # true T, true max(seq_lens)
+            hidden = self.model(self.input_ids[:T], self.positions[:T])
+
+        # hidden is packed [T, ...]. rows indexes the last query of each
+        # real request (the token we sample). Graph padding is skipped.
+        logits = self.model.logits(hidden[rows])
+        return sample(logits, [s.req.params for s in batch]), logits
+
+
+
+
+
+
+
+
+
+
 def attention_demo():
     """
     Check paged attention against plain dense attention on random data, no model needed.
@@ -540,21 +1079,6 @@ def attention_demo():
             print(f"  {name:8s} q_len={q_len:3d} kv_len={kv_len:3d}  max_err={err:.2e}  "
                   f"{'OK' if err < tol else 'MISMATCH'}")
 
-        
-
-
-
-
-
-
-
-     
-
-
-
-
-
-        
 
 
 def kv_cache_demo():
