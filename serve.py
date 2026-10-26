@@ -1425,18 +1425,18 @@ def main():
     #     benchmark(a)
     #     return
 
-    # cfg = Config(model=a.model, attention_backend=a.attention_backend,
-    #              max_model_len=a.max_model_len, max_num_seqs=a.max_num_seqs,
-    #              max_num_batched_tokens=a.max_num_batched_tokens,
-    #              gpu_memory_utilization=a.gpu_memory_utilization,
-    #              use_cuda_graphs=not a.no_cuda_graphs,
-    #              enable_prefix_caching=not a.no_prefix_caching)
-    # engine = Engine(cfg)
-    # if a.command == "generate":
-    #     out = engine.generate([a.prompt], SamplingParams(temperature=a.temperature,
-    #                                                      max_tokens=a.max_tokens))[0]
-    #     print(a.prompt + out.text)
-    #     return
+    cfg = Config(model=a.model, attention_backend=a.attention_backend,
+                 max_model_len=a.max_model_len, max_num_seqs=a.max_num_seqs,
+                 max_num_batched_tokens=a.max_num_batched_tokens,
+                 gpu_memory_utilization=a.gpu_memory_utilization,
+                 use_cuda_graphs=not a.no_cuda_graphs,
+                 enable_prefix_caching=not a.no_prefix_caching)
+    engine = Engine(cfg)
+    if a.command == "generate":
+        out = engine.generate([a.prompt], SamplingParams(temperature=a.temperature,
+                                                         max_tokens=a.max_tokens))[0]
+        print(a.prompt + out.text)
+        return
     
     # import uvicorn
     # print(f"[tinyserve] serving {a.model} on http://localhost:{a.port}")
