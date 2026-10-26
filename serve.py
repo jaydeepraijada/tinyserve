@@ -1169,6 +1169,9 @@ class Engine:
         for i, (s, tok) in enumerate(zip(batch, tokens)):
             req = s.req
 
+            # this forward wrote K/V for num_new more tokens
+            req.num_computed_tokens += s.num_new
+
             # chunked prefill that stops mid-prompt, we wrote k/v for those tokens
             # but the last position is not the next output token, so we throw
             # these samples away
@@ -1221,6 +1224,366 @@ class Engine:
                 if o.finished:
                     done[o.request_id] = o
         return [done[r] for r in rids]
+
+### BUILD OPENAI COMPATIBLE SERVER
+class AsyncEngine:
+    """
+    This class bridges the async web server (FastAPI) with a synchronous, compute heavy 
+    model engine. It runs the model in a dedicated background thread, so that web requests
+    are never blocked while the GPU is processing.
+    """
+    def __init__(self, engine: Engine):
+
+        self.engine = engine
+
+        # the inbox is a threadsafe queue. The web server drops requests here and the 
+        # background engine picks them up.
+        # # Messages look like: ("add", request_id, (prompt, params)) OR ("abort", request_id, None) 
+        self.inbox = queue.Queue()
+
+        # A dictionary mapping each active request_id to its specific web server event loop
+        # and an asyncio.Queue. This is how the engine thread sends tokens back to the right user.
+        self.streams: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Queue]] = {}
+
+        # Start the background thread immediately upon initialization.
+        # daemon=True means this thread will automatically die if the main program exits.
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        """
+        The main engine thread loop. It continuously checks for new web requests 
+        and drives the model forward one step (token) at a time.
+        """
+        while True:
+
+            # check if the engine is currently processing anything. If its
+            # completely empty, we want the thread to sleep (block = True)
+            # to save CPU. If its busy, we dont want it to sleep (block=False)
+            block = not self.engine.has_work()
+
+            # drain the inbox of all currently waiting messages
+            while True:
+                try:
+                    # attempt to get a message from the webserver
+                    kind, rid, payload = self.inbox.get(block=block)
+                except queue.Empty:
+                    # If inbox is empty, break out and move onto processing the model step
+                    break
+
+                # we recieved atleast one message, so the engine is definitely busy now
+                # we set block=False so subsequent loop iterations dont get stuck waiting
+                # if tehre are no more immediate messages
+                block = False
+
+                if kind == "add":
+                    # A new request arrived. We add it to the engine's scheduler.
+                    # It will be included in the next batch processed by engine.step().
+                    try:
+                        self.engine.add_request(*payload, request_id=rid)
+                    except Exception:
+                        # e.g. prompt too long. Don't let it kill this thread,
+                        # finish the client's stream with an error instead
+                        traceback.print_exc()
+                        stream = self.streams.get(rid)
+                        if stream is not None:
+                            loop, q = stream
+                            loop.call_soon_threadsafe(q.put_nowait, Output(
+                                rid, "", "", [], True, "error", 0, 0))
+                else:
+                    # The client disconnected ("abort"). Tell the engine to drop it from GPU memory.
+                    self.engine.abort(rid)
+
+            # at this point the scheduler has all new and existing requests
+            try:
+                # Tell the model to do one forward pass. It calculates the next token 
+                # for every active request simultaneously (Continuous Batching).
+                outputs = self.engine.step()
+            except Exception:
+                traceback.print_exc()
+                continue
+
+            # route the outputs back to the webserver
+            for o in outputs:
+                # Find where this output belongs
+                stream = self.streams.get(o.request_id)
+
+                if stream is not None:
+                    loop, q = stream
+                    # we are currently in the background thread, but q belongs to the webservers
+                    # async event loop. asyncio is not threadsafe, so we use call_soon_threadsafe
+                    # to safely push the output o into the webservers queue
+                    loop.call_soon_threadsafe(q.put_nowait, o)
+
+    async def generate(self, prompt, params: SamplingParams):
+        """
+        Called by FastAPI for each user request. It acts as an async generator, 
+        yielding tokens as they arrive from the engine thread.
+        """
+
+        # Create a unique ID for this request
+        rid = uuid.uuid4().hex      
+
+        # create a personal queue to recieve tokens for this specific request
+        q: asyncio.Queue = asyncio.Queue()
+
+        # Register this request so the engine thread knows where to send the data
+        self.streams[rid] = (asyncio.get_running_loop(), q)
+
+        # drop the request into the engine threads inbox
+        self.inbox.put(("add", rid, (prompt, params)))
+
+        finished = False
+        try:
+            while not finished:
+
+                # wait async for the engine thread to push a token into our queue
+                o = await q.get()
+                finished = o.finished
+                yield o # stream the token to the user
+
+        finally:
+            # cleanup, this block runs when generation finishes
+            self.streams.pop(rid, None)
+            if not finished:  # the client disconnected mid-generation
+                self.inbox.put(("abort", rid, None))
+
+def build_shared_prefix(tok, alpaca, num_tokens: int, seed: int) -> str:
+    """
+    A long system prompt every request starts with and instruction plus few shot
+    examples drawn from alpaca until we hit atleast num_tokens. This is obviously
+    a little weird as it will probably mess with the final answers, but we dont
+    really care about generation quality, simply throughput and this is an
+    easy way to test prefix cache. 
+    """
+    rng = random.Random(seed + 1)
+    text = ("You are a helpful assistant. Answer the user's request directly and "
+            "concisely. Here are some examples of good answers:\n")
+    while len(tok(text)["input_ids"]) < num_tokens:
+        x = alpaca[rng.randrange(len(alpaca))]
+        text += (f"\n### Request\n{x['instruction']} {x['input'] or ''}".rstrip()
+                 + f"\n### Answer\n{x['output']}\n")
+    return text
+
+def load_benchmark_prompts(tok, num_prompts: int, edges: list[int], seed: int, chat: bool,
+                           prefix_tokens: int = 0):
+    """
+    Real instructions from Alpaca + Dolly, sampled equally across length bins.
+
+    With chat=True each instruction is wrapped in the model's chat template, so
+    the model answers and stops at its end-of-turn token. Raw text has no
+    natural end, the model just keeps writing until max_tokens.
+
+    With prefix_tokens > 0 every prompt also starts with the same system
+    prompt of about that many tokens. Bins are still decided by the request's
+    own length, without the shared prefix.
+    """
+
+    alpaca = load_dataset("tatsu-lab/alpaca", split="train")
+    dolly = load_dataset("databricks/databricks-dolly-15k", split="train")
+    texts = ([x["instruction"] + (x["input"] or "") for x in alpaca]
+             + [x["instruction"] + " " + (x["context"] or "") for x in dolly])
+
+    def encode(texts, system=""):
+        # tokenize with the model's own tokenizer, so lengths are in the units
+        # the engines actually pay for (template tokens included)
+        if chat and tok.chat_template:
+            msgs = [([{"role": "system", "content": system}] if system else [])
+                    + [{"role": "user", "content": t}] for t in texts]
+            texts = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
+                                            enable_thinking=False)
+            return tok(texts, add_special_tokens=False)["input_ids"]
+        return tok([system + "\n\n" + t if system else t for t in texts],
+                   add_special_tokens=True)["input_ids"]
+
+    # bin every request by its own length, then sample equally per bin
+    lens = [len(p) for p in encode(texts)]
+    names = ["short", "medium", "long"][:len(edges) - 1]
+    by_bin = {name: [i for i, n in enumerate(lens) if lo <= n < hi]
+              for name, lo, hi in zip(names, edges, edges[1:])}
+
+    rng = random.Random(seed)
+    per_bin = [num_prompts // len(names) + (i < num_prompts % len(names)) for i in range(len(names))]
+    picked = []
+    for name, k in zip(names, per_bin):
+        assert len(by_bin[name]) >= k, f"bin {name} only has {len(by_bin[name])} prompts"
+        picked += [(name, i) for i in rng.sample(by_bin[name], k)]
+    rng.shuffle(picked)
+
+    # only now prepend the shared system prompt (if any) to the chosen requests
+    system = build_shared_prefix(tok, alpaca, prefix_tokens, seed) if prefix_tokens else ""
+    prompts = encode([texts[i] for _, i in picked], system)
+    return [b for b, _ in picked], prompts, names
+
+@torch.inference_mode()
+def hf_static_generate(model, tok, prompts: list[list[int]], max_tokens: int,
+                       batch_size: int, stop_ids: set[int], ignore_eos: bool):
+    """
+    The standard method: cut the prompts into fixed batches in arrival order,
+    left pad each batch to its longest prompt and call model.generate. A batch
+    only finishes when its slowest row does, and the next batch cannot start
+    until then, so a short request that lands next to a long one waits for it.
+
+    Returns per-request (num_output_tokens, finish_time) plus waste counters:
+        pad_prompt:  prompt slots that were padding
+        pad_decode:  decode slots spent on rows that had already finished
+    """
+    pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+    n_out, done_at = [0] * len(prompts), [0.0] * len(prompts)
+    pad_prompt = pad_decode = 0
+    t0 = time.perf_counter()
+
+    ### loop through the prompts in fixed sized batches
+    for i in range(0, len(prompts), batch_size):
+        chunk = prompts[i:i + batch_size]
+
+        # get the longest sample in this batch
+        L = max(len(p) for p in chunk)
+
+        # left pad, generation continues on the right
+        ids = torch.full((len(chunk), L), pad_id, dtype=torch.long)
+        mask = torch.zeros((len(chunk), L), dtype=torch.long)
+        for j, p in enumerate(chunk):
+            ids[j, L - len(p):] = torch.tensor(p)
+            mask[j, L - len(p):] = 1
+
+        # built in generate
+        gen = model.generate(input_ids=ids.cuda(), attention_mask=mask.cuda(), do_sample=False,
+                             max_new_tokens=max_tokens,
+                             min_new_tokens=max_tokens if ignore_eos else 0,
+                             eos_token_id=list(stop_ids), pad_token_id=pad_id)
+        torch.cuda.synchronize()
+        t = time.perf_counter() - t0
+
+        # count each row's real output, up to and including its first stop
+        # token (the same way the engine counts it)
+        out = gen[:, L:].tolist()
+        steps = len(out[0]) # total generations
+        for j, row in enumerate(out):
+            k = len(row) if ignore_eos else next(
+                (s + 1 for s, tok_id in enumerate(row) if tok_id in stop_ids), len(row))
+            n_out[i + j], done_at[i + j] = k, t
+            pad_decode += steps - k
+        pad_prompt += L * len(chunk) - sum(len(p) for p in chunk)
+
+    return n_out, done_at, pad_prompt, pad_decode
+
+def tinyserve_generate(engine: Engine, prompts: list[list[int]], max_tokens: int, ignore_eos: bool):
+    """
+    Same prompts, all handed to the engine up front. This is Engine.generate
+    but it also records when each request finished: continuous batching lets
+    a short request leave the batch (and free its pages) as soon as it is
+    done, and a waiting request takes its place on the very next step.
+
+    Also returns how many prompt tokens of each request came from the prefix
+    cache instead of being computed.
+    """
+    params = SamplingParams(temperature=0.0, max_tokens=max_tokens, ignore_eos=ignore_eos)
+    rids = [engine.add_request(p, params) for p in prompts]
+    done: dict[str, tuple[int, float, int]] = {}
+    t0 = time.perf_counter()
+    while engine.has_work():
+        for o in engine.step():
+            if o.finished:
+                done[o.request_id] = (len(o.token_ids), time.perf_counter() - t0,
+                                      o.num_cached_tokens)
+    return ([done[r][0] for r in rids], [done[r][1] for r in rids],
+            [done[r][2] for r in rids])
+
+def benchmark(a):
+    """
+    Real prompts (equal per length bin), chat formatted, all starting with
+    the same long system prompt, all available at t=0, greedy, stop at EOS or
+    max_tokens. Every run uses the same weights, dtype, GPU, prompts and stop
+    tokens. Three runs:
+
+        HF static:                   fixed batches, padded, each batch waits
+                                     for its slowest row
+        tinyserve (no prefix cache): continuous batching over a paged KV
+                                     cache, chunked prefill, CUDA graphs for
+                                     decode; every prompt is fully computed
+        tinyserve (prefix cache):    the same, but the shared system prompt is
+                                     computed once and its KV pages are reused
+
+    Each run is freed before the next one starts, so each gets the whole card.
+    """
+    tok = AutoTokenizer.from_pretrained(a.model)
+    stop_ids = {tok.eos_token_id}
+
+    # grab eos token
+    eos = GenerationConfig.from_pretrained(a.model).eos_token_id
+    stop_ids |= set(eos if isinstance(eos, list) else [eos])
+
+    # dont need none its sometimes there
+    stop_ids.discard(None)
+
+    # get benchmark prompts
+    edges = [int(x) for x in a.bench_bins.split(",")]
+    bins, prompts, names = load_benchmark_prompts(tok, a.bench_num_prompts, edges, a.seed,
+                                                  chat=not a.bench_raw,
+                                                  prefix_tokens=a.bench_prefix_tokens)
+
+    n = len(prompts)
+    total_in = sum(map(len, prompts))
+    print(f"[bench] {n} prompts, {total_in:,} prompt tokens, max_tokens={a.bench_max_tokens}, "
+          f"{'ignore_eos' if a.ignore_eos else 'stop at EOS'}, "
+          f"shared system prompt of ~{a.bench_prefix_tokens} tokens")
+    for name, lo, hi in zip(names, edges, edges[1:]):
+        lens = [len(p) for b, p in zip(bins, prompts) if b == name]
+        print(f"  {name:6} [{lo:>4}, {hi:>4}) tokens: {len(lens):3d} prompts, "
+              f"mean {sum(lens) / len(lens):6.1f} tokens (with system prompt)")
+
+    results = {}
+
+    # 1. the standard way
+    print(f"\n[bench] HF generate, static batches of {a.bench_hf_batch_size} ...", flush=True)
+    attn = "flash_attention_2" if FLASH_ATTN_AVAILABLE else "sdpa"
+    hf = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16, attn_implementation=attn).cuda().eval()
+    hf_static_generate(hf, tok, prompts[:2], 4, 2, stop_ids, a.ignore_eos)   # warm up
+    t = time.perf_counter()
+    n_out, done_at, _, _ = hf_static_generate(
+        hf, tok, prompts, a.bench_max_tokens, a.bench_hf_batch_size, stop_ids, a.ignore_eos)
+    results["HF static"] = (time.perf_counter() - t, n_out, done_at, [0] * n)
+    del hf
+    gc.collect(); torch.cuda.empty_cache()
+
+    # 2. our way, without and then with prefix caching
+    for caching in (False, True):
+        name = f"tinyserve ({'prefix cache' if caching else 'no prefix cache'})"
+        print(f"[bench] {name} ...", flush=True)
+        cfg = Config(model=a.model, attention_backend=a.attention_backend,
+                     max_model_len=a.max_model_len, max_num_seqs=a.max_num_seqs,
+                     max_num_batched_tokens=a.max_num_batched_tokens,
+                     gpu_memory_utilization=a.gpu_memory_utilization,
+                     use_cuda_graphs=not a.no_cuda_graphs,
+                     enable_prefix_caching=caching)
+        engine = Engine(cfg)
+
+        # warm up on an unrelated prompt, so the shared system prompt is not
+        # already sitting in the cache when the clock starts
+        engine.generate([tok.encode("Warm up.")] * 2, SamplingParams(temperature=0.0, max_tokens=4))
+        t = time.perf_counter()
+        n_out, done_at, cached = tinyserve_generate(engine, prompts, a.bench_max_tokens,
+                                                    a.ignore_eos)
+        results[name] = (time.perf_counter() - t, n_out, done_at, cached)
+        del engine
+        gc.collect(); torch.cuda.empty_cache()
+
+    # 3. report
+    df = pd.DataFrame({
+        name: {
+            "wall s": wall,
+            "req/s": n / wall,
+            "out tok/s": sum(n_out) / wall,
+            "all tok/s": (total_in + sum(n_out)) / wall,
+            "p50 done s": np.percentile(done_at, 50),
+            "p90 done s": np.percentile(done_at, 90),
+            "cached %": 100 * sum(cached) / total_in,
+        }
+        for name, (wall, n_out, done_at, cached) in results.items()
+    }).T
+    print()
+    print(df.round(2).to_string())
+
 
 
 
