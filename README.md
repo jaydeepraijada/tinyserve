@@ -117,7 +117,7 @@ curl localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d '
 }'
 ```
 
-Any OpenAI client works by pointing its base URL at `http://localhost:8000/v1`. Other endpoints:
+Any OpenAI client works by pointing its base URL at `http://localhost:8000/v1`. [`test.py`](test.py) does this with the official `openai` package and streams a chat answer: start the server, then run `python test.py`. Other endpoints:
 
 - `GET /health`
 - `GET /v1/models`
