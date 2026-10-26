@@ -26,7 +26,31 @@ The model code (RMSNorm, RoPE, GQA attention, SwiGLU MLP) is written from scratc
 | tinyserve, no prefix cache | 7.7 s | 13.0 | 663 | 4.9 / 5.9 s | 0% |
 | tinyserve, prefix cache | **5.7 s** | **17.7** | **893** | **3.0 / 3.9 s** | 40% |
 
-With the same weights, prompts and GPU, continuous batching over a paged cache is about 13× faster than static batching, and prefix caching adds another 1.4×.
+With the same weights, prompts and GPU, continuous batching over a paged cache is about 13× faster than static batching, and prefix caching adds another 1.35×.
+
+### Side by side
+
+The same 16 chat prompts on Qwen3-0.6B, run through Hugging Face `generate()` in static batches of 4 and through tinyserve on the DGX Spark. Greedy decoding, up to 96 new tokens, real per-token timings, played back at half speed. Four of the prompts are shown; the squares track all 16.
+
+**flash-attn, 256-token pages, CUDA graphs.** The ~40-token shared system prompt doesn't fill a 256-token page, so nothing is cached here.
+
+![tinyserve vs Hugging Face, 256-token pages](assets/tinyserve-vs-hf-256.gif)
+
+![Results for the 256-token-page run](assets/results-256.png)
+
+**torch backend, 16-token pages.** Small pages let the short system prompt hit the prefix cache (52% of prompt tokens reused). flash-attn only accepts pages in multiples of 256, so this run uses the slower torch attention, without CUDA graphs.
+
+![tinyserve vs Hugging Face, 16-token pages](assets/tinyserve-vs-hf-16.gif)
+
+![Results for the 16-token-page run](assets/results-16.png)
+
+| Same 16 prompts | Total time | Throughput | Median first token | Median finish | Prompt tokens cached |
+|---|---|---|---|---|---|
+| Hugging Face, static batches of 4 | 3.51 s | 158 tok/s | 1.34 s | 2.13 s | 0% |
+| tinyserve, 256-token pages + flash-attn | **0.70 s** (5.0×) | **817 tok/s** (5.2×) | **0.04 s** (33×) | **0.32 s** (6.6×) | 0% |
+| tinyserve, 16-token pages + torch | 1.89 s (1.8×) | 304 tok/s (1.9×) | 0.05 s (26×) | 1.38 s (1.5×) | 52% |
+
+The 16-token run is compared against its own Hugging Face baseline (3.43 s, 162 tok/s, measured in the same session). Greedy outputs differ slightly between the two systems because of bf16 rounding, so tinyserve generated a few more tokens (569 and 574 against 556); throughput accounts for that.
 
 ## Setup
 
