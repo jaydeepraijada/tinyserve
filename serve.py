@@ -150,6 +150,79 @@ class Request:
 class KVCacheManager:
     #Manage which physical Kv-cache block each request owns
 
+    """
+    This manages which phyisical  KV-cache blocks each request owns
+
+    The block manager o nly manages block ids, it doesnt touch GPU memory
+    the model runner later converts those ids to actual kv addresses. 
+
+    Each request sees its kv cache as a sequence of logical blocks, while
+    the blocks themselves can live anywhere in GPU memory. For example
+    with block_size = 4 and a request containing:
+    
+    [A B C D E F G H I]
+
+    the request needs three logical blocks::
+
+        logical block 0 -> tokens [A B C D]
+        logical block 1 -> tokens [E F G H]
+        logical block 2 -> tokens [I]
+
+    The block manager might assign physical blocks:
+    
+        req.block_ids = [17, 42, 81]
+
+    so tokens A-D live in physical block 17, E-H in block 42, and I in block 81.
+    The physical blocks do not need to be contiguous.
+
+    For token i:
+
+        logical_block = i // block_size
+        offset        = i % block_size
+        block_id      = req.block_ids[logical_block]
+
+    if the cache is viewed as one flat array the corresponding slot is:
+    
+        slot = block_id * block_size + offset
+
+    For example, token F has i = 5:
+
+        logical_block = 5 // 4 = 1
+        offset = 5 % 4 = 1
+        block_id = req.block_ids[1] = 42
+        slot = 42 * 4 + 1 = 169
+
+    Prefix Caching: full blocks can be reused by later requests (i.e. things
+    like the system prompt can be reused for each request). Each full block is
+    identified by a hash of its own parent blocks hash and its own tokens:
+
+        block_hash = hash(parent_hash, tokens)
+
+    The parent hash matters beacuse the same tokens can have different KV values
+    when they occur after different prefixes. For example:
+
+    Request A: 
+        [system prompt] -> block 17 -> [A B C D] -> block 42 -> [E F G H] 
+    
+    Request B: 
+        [system prompt] -> block 17 -> [A B C D] -> block 42 -> [E F G H] -> [X Y]
+
+
+    Request B can reuse block 17 and 42 instead of recomputing their KV values
+    it only needs a new block for [X Y]. 
+
+    Only complete blocks are entered into the prefix cache, a partial final block
+    cannot be reused until it is full. When an active request finishes, its
+    cached blocks are not immediately erased, they become available for reuse
+    and are placed on a least recently used (lru) free list while their hash-to-block
+    mapping stays searchable. If a later request asks for the same prefix, the block can
+    be taken back without recomputing its KV values. 
+
+    Eventually, if GPU is memory is needed for a new block, the least recently used
+    cached block is evicted and its physical storage is reused. At that point
+    its old prefix KV is lost and must be recomputed if requested again.  
+
+    """
     def __init__(self, num_blocks, block_size, enable_caching):
 
         self.block_size = block_size
@@ -178,9 +251,47 @@ class KVCacheManager:
 
     def _update_hashes(self, req):
 
+        """
+        We will grow req.block_hashes here so there is one hash per completed
+        block of token_ids. Effectively:
+
+        hash_i = hash( (hash_{i-1} or None, tokens[i*B : (i+1)*B]) )
+
+        Parent has is in the tuple so a block's identity commits the 
+        entire prefix, now just its own tokens
+        """
+        # how many items per block
         bs = self.block_size
+        # assume our requested tokens are
+        # [A B C D E F G H I]
+        # and our block size is 4
+
+        # The request needs hashes for complete blocks:
+        # [A B C D]
+        # [E F G H]
+        # but not the final
+        # [I]
+        # as that block isnt full yet
+
+        # so if we have 9 tokens and blocks size of 4, we have 2
+        # complete blocks and 1 incomplete. So we can log the hash
+        # for the two compelte ones
         while len(req.block_hashes) < req.num_tokens // bs:
+            # initially i = 0 (we start empty) and len(req.block_hashes) = 0
             i = len(req.block_hashes)
+            # if it wasnt empty (after first iteration) then the parent is the
+            # last block available for this specific request (-1)
+            # i = 0: parent = None
+            # i = 1: parent = hash(block 0)
+            # i = 2: parent = hash(block 1)
+            # which gives us the chain
+
+            # we hash the parent along with the tokens
+            # at i = 0 req.token_ids[0:4] is [A B C D],
+            # at i = 1 req.token_ids[4:8] gives [E F G H]
+            # and our hashes become
+            # H0 = hash(None, [A B C D])
+            # H1 = hash(H0, [E F G H])
             parent = req.block_hashes[-1] if req.block_hashes else None
             req.block_hashes.append(
                 hash(
@@ -189,17 +300,54 @@ class KVCacheManager:
             )
     def find_cached_prefix(self, req):
 
+        """
+        This provides us the block ids of the longest cached prefix, 
+        telling us how much of this requests prefix have we already
+        computed?
+
+        This is done by:
+
+            1. refresh the hashes using the _update_hashes method
+            2. walk the hashes left to rigth, stopping at the first miss
+            3. cap at (num_tokens - 1) // B so atleast one token is 
+               always computed (we need its logits)
+        """
         if not self.enable_caching:
             return []
 
+        # generate the requests hashes
+        # suppose the request is [A B C D E F G H I J]
+        # H0 = hash(None, [A B C D])
+        # H1 = hash(H0,   [E F G H])
+        # and remember from an earlier request this would be the same thing!
+        # hash of the same input MUST give the same hash integer value
+        # regardless of the request it came from
         self._update_hashes(req)
 
         # num_token = 8 (8-1)//4 == 1
+        # we have to always leave atleast one token to compute. Suppose
+        # num_tokens = 8 and block_size = 4, naively, 8 // 4 = 2 blocks.
+        # but instead we will do (8 - 1) // 4 = 1. To generate the next
+        # token you need the logits at the last prompt position, which come
+        # from running that token through the whole model. It shidden states
+        # passes through every layer and then the LM head, the KV cache only
+        # keeps the K,V vectors of teh past tokens to later tokens can attend
+        # to them, it doesnt keep hidden states or logits. So if a requests
+        # entire prompt came from the cache, the scheduler later would have
+        # 0 tokens to run, nothing to feed the model, no logits, no first
+        # output tokens, num_tokens - 1 caps the cache hit so atleast the last
+        # token is always run
         max_blocks = (req.num_tokens - 1) // self.block_size
 
+        # Now we look up for matching hashes
         hits = []
+        # suppose H0 -> block 17, H1 -> block 42, H2 -> missing
+        # then our hits are block 17 and 42
         for h in req.block_hashes[:max_blocks]:
             b = self.hash_to_block.get(h)
+            # cache hits have to be contiguous, we cant have 2 hits, a miss
+            # and then another hit, as the K,V values of the third hit
+            # are different when attended to the different miss
             if b is None:
                 break
             hits.append(b)
@@ -209,27 +357,65 @@ class KVCacheManager:
     # This is  
     def allocate(self, req, num_new_tokens, cached=()):
 
+        """
+        We need to ensure the page table covers the total
+
+            total = already_computed + |cached| * B + num_new_tokens
+            need  = ceil(total / B) - |req.block_ids| - |cached|
+
+        basically: how many NEW physical pages do I need to pull
+        off of the free list so this requests page table covers every 
+        token that will exist after this step?
+        """
+        # first we calculate the total tokens
+        # pretend we have  8 tokens already, 4 tokens in a cached prefix
+        # and we want 6 new tokens, that is a total of 18 tokens. We need
+        # ceil(18 / 4) = 5 blocks to fit that
         total = (
             req.num_computed_tokens 
             + len(cached) * self.block_size
             + num_new_tokens
         )
 
+        # compute ceiling integer division
         total_needed_blocks = -(-total // self.block_size)
 
+        # subtract out the number of blocks the request already has
+        # as well as the blocks we are about to reuse. need can be
+        # 0 as in a previous step we may have allocated a whole block
+        # and this decode step is filling unused slots in it
         need = total_needed_blocks - len(req.block_ids) - len(cached)
+        # cached hits with ref_cnt == 0 are still sitting on the free list
+        # attaching them removes them from free, so they look like
+        # they consume a free slot even though we arent actually grabbing
+        # a blank page
+        #   need: brand new pages we will add
+        #   reclaim: which hashed pages will you take off free
         reclaim = sum(1 for b in cached if self.ref_cnt[b] == 0)
 
+        # if i need new blocks plus cached blocks that must be reclaimed from
+        # the free pool, do I have enough free capacity?
         if need + reclaim > self.num_free:
+            # if false then nothing to do until space opens up
             return False
 
         # claim the cached blocks
         for b in cached:
 
+            # suppose cached = [17, 42]
             if self.ref_cnt[b] == 0:
+                # if block 17 was sitting on the free list
+                # free = [17, 23, 31, 44]
+                # we now just have free = [23, 31, 44]
+                # which means that this block is no longer cached or fre,
+                # an active request owns it
                 del self.free[b]
 
+            # update the reference counter, if it was 0 we now have our new
+            # reference. If it wasnt 0, lets say 1 as somthing else was using
+            # it, now it would be 2, as 2 requests are using this block
             self.ref_cnt[b] += 1
+            # the request now points at the cached physical block
             req.block_ids.append(b)
 
         # now we allocate new blocks
@@ -237,10 +423,17 @@ class KVCacheManager:
         for _ in range(max(need, 0)):
             b, _ = self.free.popitem(last = False) # gives the first item
 
+            # we are evicting b, but it still may be in our mapping
+            # so we will delete it from there too (all the old metadata)
+            # if we dont , then the recycled block would claim some information
+            # is in there, when really that information has changed
             if self.block_hash[b] is not None:
                 self.hash_to_block.pop(self.block_hash[b], None)
                 self.block_hash[b] = None
 
+            # give the block to the request
+            # for example blocks 16 now has ref_count = 1 and
+            # is owned by the new request
             self.ref_cnt[b] = 1
             req.block_ids.append(b)
 
@@ -248,19 +441,32 @@ class KVCacheManager:
         return True
 
     def _register_full_blocks(self, req, num_tokens):
+        """
+        Did any of the blocks we just allocated become filled with known 
+        tokens? if yes then we add them to the prefix cache
+        """
         if not self.enable_caching:
             return 
 
+        # make sure all relevant block hashes exist
         self._update_hashes(req)
 
+        # Loop over only complete full blocks
         for i in range(min(num_tokens, req.num_tokens)// self.block_size):
+            # get the block and hash
             b, h = req.block_ids[i], req.block_hashes[i]
 
+            # register the hash to the block
             if self.block_hash[b] is None:
                 self.block_hash[b] = h
+                # we use set default as if the hash is already present
+                # for some reason, there is no need to overwrite it
                 self.hash_to_block.setdefault(h,b)
 
     def free_request(self, req):
+        # clear out everything at the end of a request
+        # resetting the state back and returning the blocks
+        # back for use by other requests
         for b in reversed(req.block_ids):
             self.ref_cnt[b] -= 1
             if self.ref_cnt[b] == 0:
@@ -293,11 +499,22 @@ class ScheduledRequest:
 
 class Scheduler:
 
+    """Called once per step: which requests run, and how many tokens each.
+
+    1. Running requests go first (so decodes are never starved). If the KV
+       cache is full, PREEMPT the newest running request: free its blocks and
+       push it back to the waiting queue. It is recomputed later, and prefix
+       caching usually makes that cheap.
+    2. Then admit waiting requests while there is token budget, a free
+       sequence slot, and KV space. Long prompts are CHUNKED to fit the budget.
+    """
     def __init__(self, cfg, kv):
 
         self.cfg = cfg
         self.kv = kv
+        # FIFO of not yet admitted (or preempted) requests
         self.waiting = deque()
+        # currently holding KV pages (from oldest to newest)
         self.running = []
 
     def add(self, req):
@@ -308,6 +525,8 @@ class Scheduler:
 
     def schedule(self):
 
+        # one token budget is shared by prefill chunks and decode tokens, so a long
+        # prompt can never stall decodes for more than one steps worth of tokens
         budget = self.cfg.max_num_batched_tokens
 
         # for each request id, how many tokens will we run this step?
@@ -319,56 +538,116 @@ class Scheduler:
         # running requests
         i = 0
 
+        # self.running is all of the currently running tasks, we loop through all of them
+        # as long as we have some budget left
         while i < len(self.running) and budget > 0:
 
             # what request?
+            # grab that request that is running
             req = self.running[i]
 
+            # what this request still owes. 1 token in decode (the token just
+            # sampled), or the rest of its prompt chunk. num_tokens counts
+            # prompt + everything generated so far
             n = min(req.num_tokens - req.num_computed_tokens, budget)
 
+            # allocate() checks if a request can fit or not.
+            # running is in admit order (oldest at [0] newest at [-1])
+            # we only ever evict from the newest end, so a request is never
+            # preempted to make room for one younger than it.
             while not self.kv.allocate(req, n):
                 # A B C -> A B | C (C is the victim)
+                # pop will always evict the newest entry, this is so we can get the
+                # older stuff done first before resuming the newer ones
+                # for example, lets say we have requests [A B C], where C is the newest
+                # and A is the oldest. i is currently on A, we try allocate(A, n), if
+                # it fails, we will evict C and retry. If allocate(A, n) fails again,
+                # we will evict B and retry. If it still breaks (the victim is the req)
+                # then we evict A and break, A is no longer running so the outer loop
+                # stops too and A is not added to the plan
                 victim = self.running.pop()
 
+                # drops the victims pages. All shared prefix pages (ref_cnt > 1)
+                # will survive, the rest return to the free queue (tail first). Hashes
+                # are also kept so full blocks remain findable for future potential
+                # cache hits
                 self.kv.free_request(victim)
+                # Its KV is gone, so it restarts from scratch next time. Its
+                # token_ids (prompt + generated so far) are untouched, so the
+                # recompute covers both. full blocks usually come back from the
+                # prefix cache, the partial tail page is always recomputed.
                 victim.num_computed_tokens = 0
+                # we will put the victim at the front of the waiting list so it retries
+                # before any brand new requests. We dont do this on this call, as preempted=True
+                # will skip phase 2, we dont admit anyone new as our scheduler is currently
+                # oversubscribed
                 self.waiting.appendleft(victim)
+                # victim always comes from index >= i and plan[] is only written after this
+                # loop, so this is always 0 in practice anyway, but we keep it just for
+                # completeness
                 budget += plan.pop(victim.request_id, 0)
+                # set flag that something was skipped
                 preempted = True
 
+                # req is the newest running request, there is nobody younger to evict
+                # anymore, so it preempts itself. If it is also the only running request
+                # the cache simply cannot hold it and will retry forever. We break here
+                # but a more complete version would verify that the cache fits the max_model_len
+                # tokens, but we keep it simple here
                 if victim is req:
                     break
 
+            # the req preempted itself above, stop scheduling running requests,
+            # entirely this step.
             if req not in self.running:
                 break
 
+            # if req survived, we will reserve n tokens
             plan[req.request_id] = n
+            # remove n tokens from budget
             budget -= n
+            # move onto the next request
             i +=1 
 
         # currently waiting request
+        # 2. waiting requests (skip if we just had to preempt as the cache is already tight)
         while(not preempted and self.waiting and budget > 0 and len(self.running) < self.cfg.max_num_seqs):
+            # whats currently on the waiting list
             req = self.waiting[0]
 
+            # see if anythign is cached here to reuse (whole blocks only)
             cached = self.kv.find_cached_prefix(req)
+            # Tokens not covered by cache hits, capped by the budget. Vecause
+            # find_cached_prefix caps hits at (num_tokens - 1) // B, atleast one
+            # token always runs, so the results can produce logits
             n = min(req.num_tokens - len(cached) * self.cfg.block_size, budget)
 
+            # No preemption in this phase, an admitted request outranks a waiting one,
+            # then we break, not continue. The head of the queue blocks the rest (FIFO)
+            # even if a shorter request behind it would ift
             if not self.kv.allocate(req, n, cached):
                 break
 
+            # if it fit, then we will remove the req from our list of waiting
             self.waiting.popleft()
 
+            # KV that already exists for this request before the forward pass
             req.num_computed_tokens = len(cached) * self.cfg.block_size
+            # this is for reporting only, keeps the best hit ever seen (a readmission
+            # after preemption can be colder if pages were evicted meanwhile)
             req.num_cached_tokens = max(req.num_cached_tokens, req.num_computed_tokens)
 
+            # newest = tail = first victim if phase 1 of a future step runs out of pages
             self.running.append(req)
 
+            # reserve this requests slice of the current forward pass
             plan[req.request_id] = n
             budget -= n
 
         # emit the batch in running order
         batch = []
         for req in self.running:
+            # for every running request create a ScheduledRequest
             if req.request_id in plan:
                 batch.append(ScheduledRequest(
                     req, req.num_computed_tokens, plan[req.request_id]
@@ -385,14 +664,67 @@ class Scheduler:
 
 @dataclass
 class AttnMetadata:
+    """
+    Batch descriptor for one engine step, shared by every attention layer.
+
+    q is packed [T, H, D] and has no batch dimension. These fields say how
+    that stream splits into requests, where each new token's K/V is written
+    and how to read each requests paged prefix. 
+
+    There are two lengths per request:
+
+        q_len: tokens that are run this step (rows of q)
+        kv_len: keys that exist after the write (already computed + q_len)
+                as we dont compute attention until the kv is fully updated 
+                with new incoming items
+
+    For example if we have 4 tokens in cache, and we run two more at positions
+    4 and 5, our q_len = 2 (running 2 tokens) and the kv_len = 6
+
+    T = sum of q_len over the batch
+    B = num_seqs
+    """
+
+    # Flat cache address for each of the T new tokens.
+    #   slot = block_id * block_size + (t % block_size)
+    # Layer writes K/V to k_cache.view(-1, Hkv, D)[slot_mapping[t]]
+    # before attention. Attention itself does not read this field.
     slot_mapping: torch.Tensor #T
+
+    # Prefix sums of this-step query lengths. Request i owns q[qsl[i]:qsl[i+1]].
+    # qsl[0] = 0, qsl[B] = T. Flash-attn's cu_seqlens_q.
+    #   A prefill 3 + B decode 1 + C prefill 4 ->  [0, 3, 4, 8]
     query_start_loc: torch.Tensor # [B + 1]
+
+    # Prefix sums of full context lengths (kv_len), not q_len.
+    # cu_k[i+1] - cu_k[i] == seq_lens[i]. Flash-attn's cu_seqlens_k.
+    #   A kv=10, B kv=50, C kv=7  ->  [0, 10, 60, 67]
+    # Does not mean K is packed densely, K stays paged. This only tells
+    # the kernel how long each request's prefix is.
     cu_seqlens_k: torch.Tensor
+
+    # Page table. Row i is req.block_ids padded to max_blocks.
+    #   block_table[i, t // bs] = physical page holding token t of request i
+    # Only the first ceil(kv_len / bs) entries are live; the rest is
+    # null-page padding and must not be gathered. Flash-attn reads this
+    # in-kernel, torch_ref slices the live prefix and gathers in Python.
     block_table: torch.Tensor # [B x max_blocks]
+
+    # B. Live rows of block_table / entries in the cu_seqlens arrays.
     num_seqs: int
+
+    # max(q_len_i) this step
     max_query_len: int
+
+    # max(kv_len_i) this step
     max_seq_len: int
+
+    # Host copies so torch_ref can index in Python without a GPU sync per request. 
     query_start_loc_cpu: list[int]
+
+    # Per-request kv_len on host. Not prefix-summed.
+    # seq_lens_cpu[i] == cu_seqlens_k[i+1] - cu_seqlens_k[i]
+    # torch_ref uses this directly as kv_len, flash-attn uses cu_seqlens_k.
     seq_lens_cpu: list[int]
 
 def torch_ref_attention(q, # T x H x D
@@ -401,6 +733,18 @@ def torch_ref_attention(q, # T x H x D
                         meta, # query_start_loc, seq_lens, block_table
                         scale # 1/sqrt(D)
                         ):
+    """
+    Paged attention.
+
+    q:        [T, H, D]              packed queries for this step
+    k/v_cache:[n_pages, bs, Hkv, D]  paged pool
+    meta:     query_start_loc, seq_lens, block_table
+    scale:    1/sqrt(D)
+
+    For each request: gather its pages into a dense prefix, build a
+    bottom-right causal mask, call SDPA. Slow (Python loop, copy of
+    every context, host sync) but for understanding
+    """
     out = torch.empty_like(q)
 
     # H = query heads, Hkv = KV heads (GQA if H > Hkv), bs = page size
@@ -410,26 +754,49 @@ def torch_ref_attention(q, # T x H x D
     # seq_lens[i] = full context length after this step (kv_len)
     qsl, seq_lens = meta.query_start_loc_cpu, meta.seq_lens_cpu
 
+    # for each sequence that has been packed
     for i in range(meta.num_seqs):
         s, e, kv_len = qsl[i], qsl[i+1], seq_lens[i]
+
+        # tokens processed for i this step
         q_len = e - s 
 
+        # live pages only: ceil(kv_len / bs). drop the padded tail of the row (null page 0)
         blocks = meta.block_table[i, : -(-kv_len//bs)].long()
 
+        # Gather to a dense prefix
+        #   k_cache[blocks] : [n_pages, bs, Hkv, D]
+        #   flatten(0, 1)   : [n_pages*bs, Hkv, D]   pages stitched on the token axis
+        #   [:kv_len]       : drop unused slots in the last page
         # k_cache[blocks] -> [16 x Hkv x D]
         k = k_cache[blocks].flatten(0,1)[:kv_len]
         v = v_cache[blocks].flatten(0,1)[:kv_len]
 
+        # SDPA wants H KV heads. GQA: each KV head is shared by H/Hkv query heads
         k = k.transpose(0, 1).repeat_interleave(H // Hkv, 0)
         v = v.transpose(0, 1).repeat_interleave(H // Hkv, 0)
 
 
+        # bottom right causal, this steps queries are teh last q_len positions
+        # of a length kv_len sequence not 0 ... q_len - 1
         # full prefill: q_len == kv_len -> square causal mask
         # chunked_prefill: q_len < kv_len -> suffix strip
         # decode: q_len == 1 -> 1 row, all keys 
+        # if we have 4 kv positions already cached, and q_len = 2, then
+        # our kv_len = 6 (as we will have 6 kv positions after this op) 
+        # and our q_len = 2 for positions 4 and 5. Effectively, q at position
+        # 4 can attend to all the kv before it (positions 0-3) and the new 
+        # kv at the new position 4. Similarly, the q at position 5 can attend to
+        # all the positions before it (0-3 + 4 just made) as well as the kv at 
+        # the new position 5
+
+        # keys    0  1  2  3  4  5
+        # q@4     T  T  T  T  T  x  
+        # q@5     T  T  T  T  T  T
         q_pos = torch.arange(kv_len - q_len, kv_len, device = q.device)
         mask = torch.arange(kv_len, device = q.device)[None, :] <= q_pos[:, None]
 
+        # use SDPA
         o = F.scaled_dot_product_attention(
             q[s:e].transpose(0, 1), k, v, attn_mask=mask, scale = scale
         )
@@ -456,7 +823,7 @@ ATTENTION_BACKENDS = {'flash_attn': flash_attention, "torch": torch_ref_attentio
 ATTN_META: AttnMetadata | None = None
 ATTN_FN = flash_attention
 
-
+### REWRITE THE ATTENTION MECHANISM
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps):
         super().__init__()
@@ -1589,8 +1956,168 @@ def benchmark(a):
 
 
 
+def build_app(engine: AsyncEngine, model_name: str):
+
+    app = FastAPI()
+    eng = engine.engine
+
+    # Sampling defaults the model ships with in generation_config.json (Qwen3:
+    # temperature 0.6, top_p 0.95, top_k 20), used when a request leaves them
+    # out, like vLLM does. Only keys the file actually sets are used.
+    defaults = {"temperature": 1.0, "top_p": 1.0, "top_k": -1}
+    try:
+        shipped = GenerationConfig.from_pretrained(eng.cfg.model).to_diff_dict()
+        defaults.update({k: shipped[k] for k in defaults if shipped.get(k) is not None})
+    except Exception:
+        pass
+
+    def get(body, key, default):
+        v = body.get(key)
+        return default if v is None else v
+
+    def params_from(body, prompt_len):
+        # With no max_tokens the request may use the rest of the context
+        # window, like the OpenAI API. A fixed default cuts long answers off
+        # mid sentence (a thinking model can spend hundreds of tokens before
+        # it even starts answering).
+        room = eng.cfg.max_model_len - prompt_len
+        max_tokens = get(body, "max_completion_tokens", get(body, "max_tokens", room))
+        return SamplingParams(
+            temperature=get(body, "temperature", defaults["temperature"]),
+            top_p=get(body, "top_p", defaults["top_p"]),
+            top_k=get(body, "top_k", defaults["top_k"]),
+            max_tokens=min(max_tokens, room),
+            ignore_eos=get(body, "ignore_eos", False),
+        )
+
+    def error(message: str, status: int = 400):
+        return JSONResponse({"error": {"message": message, "type": "invalid_request_error"}},
+                            status_code=status)
+
+    async def respond(prompt, body, chat):
+        """
+        Core response handler. Formats the raw engine outputs into the exact json structures
+        expected by the OpenAI API clients
+        """
+        # Tokenize here rather than in the engine thread: we need the length
+        # for max_tokens, and a prompt that does not fit must be rejected with
+        # an error here. If it reached add_request in the engine thread, the
+        # assert there would kill that thread and hang every request after it.
+        ids = list(prompt) if isinstance(prompt, list) else eng.tokenizer.encode(prompt)
+        if not 0 < len(ids) < eng.cfg.max_model_len:
+            return error(f"prompt is {len(ids)} tokens, it must be between 1 and "
+                         f"{eng.cfg.max_model_len - 1} (--max-model-len)")
+        prompt = ids
+
+        params, created = params_from(body, len(ids)), int(time.time())
+
+        # prefix the ID to match OpenAIs convention
+        rid = ("chatcmpl-" if chat else "cmpl-") + uuid.uuid4().hex
 
 
+        def choice(o: Output, text: str) -> dict:
+            # fornat the actual generated text chunk, 
+            # streaming chat endpoints use a delta key while others use messages
+            if chat:
+                key = "delta" if body.get("stream") else "message"
+                return {"index": 0, key: {"role": "assistant", "content": text},
+                        "finish_reason": o.finish_reason}
+            return {"index": 0, "text": text, "finish_reason": o.finish_reason}
+
+        def usage(o: Output) -> dict:
+            # formats token counting metrics
+            return {
+                "prompt_tokens": o.num_prompt_tokens,
+                "completion_tokens": len(o.token_ids),
+                "total_tokens": o.num_prompt_tokens + len(o.token_ids),
+                "prompt_tokens_details": {"cached_tokens": o.num_cached_tokens},
+            }
+
+        obj = "chat.completion" if chat else "text_completion"
+
+        # Streaming path
+        if body.get("stream"):
+
+            async def events():
+                # iterate over async generator from the engine
+                async for o in engine.generate(prompt, params):
+                    chunk = {
+                        "id": rid,
+                        "object": obj + (".chunk" if chat else ""),
+                        "created": created,
+                        "model": model_name,
+                        "choices": [choice(o, o.delta)],
+                    }
+                    if o.finished: # we give a finsihed tag once done
+                        chunk["usage"] = usage(o)
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(events(), media_type="text/event-stream")
+
+        # Non-stream: drain until finished, return the accumulated text.
+        # If the user didn't request a stream, silently drain the generator 
+        # until finished, then return the entire accumulated result at once.
+        final = None
+        async for o in engine.generate(prompt, params):
+            final = o
+        return JSONResponse({
+            "id": rid, "object": obj, "created": created, "model": model_name,
+            "choices": [choice(final, final.text)], "usage": usage(final),
+        })
+
+    # Utility endpoint for load balancers to check if server is alive
+    @app.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    # Allows clients to query which model is currently loaded
+    @app.get("/v1/models")
+    async def models():
+        return {"object": "list", "data": [{"id": model_name, "object": "model", "created": 0,
+                                            "owned_by": "tinyserve",
+                                            "max_model_len": eng.cfg.max_model_len}]}
+
+    # Custom endpoint to monitor internal engine health (queue sizes, VRAM usage)
+    @app.get("/metrics")
+    async def metrics():
+        s = engine.engine.scheduler
+        return {
+            "running": len(s.running),
+            "waiting": len(s.waiting),
+            "free_kv_blocks": engine.engine.kv.num_free,
+        }
+
+    # Standard completions endpoint (Legacy style, no chat roles)
+    @app.post("/v1/completions")
+    async def completions(req: HTTPRequest):
+        body = await req.json()
+        return await respond(body["prompt"], body, chat=False)
+
+    # Modern Chat Completions endpoint (Requires roles like system/user/assistant)
+    @app.post("/v1/chat/completions")
+    async def chat(req: HTTPRequest):
+        body = await req.json()
+
+        # OpenAI clients may send content as a list of parts
+        # ([{"type": "text", "text": ...}, {"type": "image_url", ...}]). This is
+        # a text-only server, so keep the text parts and join them.
+        messages = [
+            {**m, "content": "".join(p.get("text", "") for p in m["content"]
+                                     if p.get("type") == "text")}
+            if isinstance(m.get("content"), list) else m
+            for m in body["messages"]
+        ]
+
+        # Uses the model's tokenizer to convert the JSON array of chat messages
+        # into the specific raw string format the model was trained on
+        # (e.g., Llama 3 or ChatML formats).
+        prompt = eng.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+            **(body.get("chat_template_kwargs") or {}),
+        )
+        return await respond(prompt, body, chat=True)
+
+    return app
 
 
 def attention_demo():
@@ -1749,9 +2276,178 @@ def kv_cache_demo():
     step(f"step {i + 1}: B finished, C is readmitted and only recomputes its uncached tail")
 
 
+def kv_manager_demo():
+    """KVCacheManager on its own (no scheduler): chunked prefill, decode, prefix sharing, eviction, out of pages."""
+    B = 4
+    mgr = KVCacheManager(num_blocks=8, block_size=B, enable_caching=True)
+
+    def cached_pages():
+        return [b for b, h in enumerate(mgr.block_hash) if h is not None]
+
+    def dump(label, *reqs):
+        print(f"\n=== {label} ===")
+        print(f"  free (LRU front): {list(mgr.free)}")
+        print(f"  ref_cnt:          {mgr.ref_cnt}")
+        print(f"  hashed pages:     {cached_pages()}")
+        for r in reqs:
+            print(f"  {r.request_id}: {r.num_tokens} tok, computed={r.num_computed_tokens}, "
+                  f"pages={r.block_ids}, hashes={len(r.block_hashes)}")
+
+    dump("fresh (page 0 reserved)")
+
+    # 1. chunked prefill
+    a = Request("A", [10, 11, 12, 13, 14, 15], SamplingParams(max_tokens=4))
+    print("\nA: 6-token prompt, budget 4. admit -> lookup once.")
+    print("  hits", mgr.find_cached_prefix(a), mgr.allocate(a, 4))
+    a.num_computed_tokens = 4
+    dump("A chunk 1, page 1 full, hashed", a)
+
+    print("\nA still live: rest of prompt. no lookup.")
+    print("  allocate +2", mgr.allocate(a, 2))
+    a.num_computed_tokens = 6
+    dump("A prompt done, page 2 half full, not hashed", a)
+
+    # 2. decode
+    print("\nA decodes two tokens into the slots in page 2.")
+    for t in (16, 17):
+        a.token_ids.append(t)
+        mgr.allocate(a, 1)
+        a.num_computed_tokens += 1
+    dump("A = 8 tokens, page 2 now hashed", a)
+
+    # 3. B shares first block only
+    b = Request("B", [10, 11, 12, 13, 77, 88], SamplingParams(max_tokens=4))
+    hits = mgr.find_cached_prefix(b)
+    print("\nB admit: same first 4 tokens.")
+    print("  hits", hits, mgr.allocate(b, 2, cached=hits))
+    b.num_computed_tokens = len(hits) * B + 2
+    dump("B attached page 1, new page for 77,88", a, b)
+    print(f"  page {hits[0]} ref_cnt={mgr.ref_cnt[hits[0]]} (A and B)")
+
+    # 4. why max_blocks uses num_tokens-1
+    c = Request("C", a.token_ids[:8], SamplingParams(max_tokens=4))
+    print("\nC admit: exactly A's 8 tokens (2 full hashed blocks).")
+    print("  hits", mgr.find_cached_prefix(c), ", one block, not two.")
+    print("  (num_tokens-1)//B leaves one token to run; cache has K/V, not logits.")
+
+    # 5. free A
+    print("\nA finishes. tail page freed first.")
+    mgr.free_request(a)
+    dump("A gone, page 2 free but still hashed; page 1 held by B", b)
+
+    # 6. eviction
+    d = Request("D", list(range(200, 220)), SamplingParams(max_tokens=4))
+    h2 = a.block_hashes[1]
+    print("\nD needs 5 pages; free =", list(mgr.free))
+    print("  A's 2nd block lives on page", mgr.hash_to_block.get(h2), "(front of free)")
+    print("  allocate D +20", mgr.allocate(d, 20))
+    d.num_computed_tokens = 20
+    dump("D took every free page", b, d)
+    print("  A's 2nd block now at", mgr.hash_to_block.get(h2), "(evicted with page 2)")
+    print("  page 1 lives: B still holds it.")
+
+    # 7. OOM on pages
+    e = Request("E", [1, 2, 3, 4], SamplingParams(max_tokens=4))
+    print("\nE: no free pages.")
+    print("  allocate E +4", mgr.allocate(e, 4), ", no mutation")
+
+def attention_compare_demo():
+    """flash_attention vs torch_ref_attention on 256-token pages (needs CUDA + flash-attn)."""
+
+    torch.manual_seed(0)
+
+    dev, dt = "cuda", torch.bfloat16
+    H, Hkv, D = 8, 2, 64 # 8 query heads sharing 2 KV heads (GQA)
+    PAGE = 256 # upstream flash-attn: pages of 256 tokens
+    scale = D ** -0.5
+
+    # what each request contributes to this step
+    spec = [("A  decode", 1, 600), ("B  fresh prompt", 5, 0), ("C  prefill chunk", 4, 300)]
+
+    # set up metadata
+    seq_lens = [q + c for _, q, c in spec]
+    n_pages = [-(-s // PAGE) for s in seq_lens]
+    num_blocks = 1 + sum(n_pages)         # page 0 is the null page, never used
+
+    # randomly scatter the pages and build the block table
+    perm = (torch.randperm(num_blocks - 1) + 1).tolist()
+    kv = torch.zeros(2, num_blocks, PAGE, Hkv, D, device=dev, dtype=dt)
+    k_cache, v_cache = kv[0], kv[1]
+
+    block_table = torch.zeros(len(spec), max(n_pages), dtype=torch.int32)
+    q_rows, k_new, v_new, slots, taken = [], [], [], [], 0
+    for i, ((_, q_len, ctx), np_) in enumerate(zip(spec, n_pages)):
+
+        # grab the pages for this specific page
+        pages = perm[taken:taken + np_]
+
+        # iterate number of pages used up
+        taken += np_
+
+        # assign the block table (padded to max blocks)
+        block_table[i, :np_] = torch.tensor(pages, dtype=torch.int32)
+        slot = lambda t: pages[t // PAGE] * PAGE + t % PAGE
+
+        # Context tokens are already in the cache from earlier steps.
+        # lets just fill it with random stuff as an example
+        for t in range(ctx):
+            k_cache.view(-1, Hkv, D)[slot(t)] = torch.randn(Hkv, D, device=dev, dtype=dt)
+            v_cache.view(-1, Hkv, D)[slot(t)] = torch.randn(Hkv, D, device=dev, dtype=dt)
+
+        # This step's tokens: the model would write these, then attend.
+        q_rows.append(torch.randn(q_len, H, D, device=dev, dtype=dt))
+        k_new.append(torch.randn(q_len, Hkv, D, device=dev, dtype=dt))
+        v_new.append(torch.randn(q_len, Hkv, D, device=dev, dtype=dt))
+        slots += [slot(t) for t in range(ctx, ctx + q_len)]
+
+    # queries concatenated to [T, H, D]
+    q = torch.cat(q_rows)
+
+    # store our slot mapping (which global index does each token go to)
+    slot_mapping = torch.tensor(slots, device=dev)
+
+    # build the query starts ([0 1 6 10])
+    qsl = [0]
+    for _, q_len, _ in spec:
+        qsl.append(qsl[-1] + q_len)
+
+    # build our kv lens [0, 601, 606, 910]
+    cu_k = [0]
+    for s_ in seq_lens:
+        cu_k.append(cu_k[-1] + s_)
+    
+    meta = AttnMetadata(
+        slot_mapping=slot_mapping,
+        query_start_loc=torch.tensor(qsl, dtype=torch.int32, device=dev),
+        cu_seqlens_k=torch.tensor(cu_k, dtype=torch.int32, device=dev),
+        block_table=block_table.to(dev),
+        num_seqs=len(spec), max_query_len=max(q for _, q, _ in spec),
+        max_seq_len=max(seq_lens), query_start_loc_cpu=qsl, seq_lens_cpu=seq_lens)
+
+    print("One step, three requests, one flat batch of", q.shape[0], "tokens\n")
+    print(f"  {'request':18} {'q_len':>6} {'ctx':>5} {'seq_len':>8}  pages (scattered)")
+    for i, (label, q_len, ctx) in enumerate(spec):
+        pages = block_table[i, :n_pages[i]].tolist()
+        print(f"  {label:18} {q_len:>6} {ctx:>5} {seq_lens[i]:>8}  {pages}")
+    print(f"\n  query_start_loc {qsl}   (request i = rows qsl[i]:qsl[i+1])")
+    print(f"  cu_seqlens_k    {cu_k}   (prefix sum of seq_lens)")
+    print(f"  slot_mapping    {slots[:6]}{' ...' if len(slots) > 6 else ''}")
+
+    # The layer writes this step's K/V into the pages, then attends.
+    k_cache.view(-1, Hkv, D).index_copy_(0, slot_mapping, torch.cat(k_new))
+    v_cache.view(-1, Hkv, D).index_copy_(0, slot_mapping, torch.cat(v_new))
+
+    out_ref = torch_ref_attention(q, k_cache, v_cache, meta, scale)
+    out_fa = flash_attention(q, k_cache, v_cache, meta, scale)
+
+    same = torch.allclose(out_ref.float(), out_fa.float(), atol=2e-2, rtol=2e-2)
+    print("Matches:", same)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("command", choices=["serve", "generate", "kv-demo", "attn-demo", "bench"])
+    ap.add_argument("command", choices=["serve", "generate", "kv-demo", "attn-demo", "bench",
+                                           "kv-manager-demo", "attn-compare-demo"])
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--prompt", default="The capital of France is")
@@ -1784,9 +2480,15 @@ def main():
     if a.command == "attn-demo":     # needs a GPU, but no model weights
         attention_demo()
         return
-    # if a.command == "bench":         # tinyserve vs HF static batching, offline
-    #     benchmark(a)
-    #     return
+    if a.command == "kv-manager-demo":   # KVCacheManager on its own: no model, no GPU
+        kv_manager_demo()
+        return
+    if a.command == "attn-compare-demo": # flash-attn vs torch reference, needs CUDA + flash-attn
+        attention_compare_demo()
+        return
+    if a.command == "bench":         # tinyserve vs HF static batching, offline
+        benchmark(a)
+        return
 
     cfg = Config(model=a.model, attention_backend=a.attention_backend,
                  max_model_len=a.max_model_len, max_num_seqs=a.max_num_seqs,
@@ -1801,10 +2503,10 @@ def main():
         print(a.prompt + out.text)
         return
     
-    # import uvicorn
-    # print(f"[tinyserve] serving {a.model} on http://localhost:{a.port}")
-    # uvicorn.run(build_app(AsyncEngine(engine), a.model), host="0.0.0.0", port=a.port,
-    #             log_level="warning")
+    import uvicorn
+    print(f"[tinyserve] serving {a.model} on http://localhost:{a.port}")
+    uvicorn.run(build_app(AsyncEngine(engine), a.model), host="0.0.0.0", port=a.port,
+                log_level="warning")
 
 
 if __name__ == "__main__":
