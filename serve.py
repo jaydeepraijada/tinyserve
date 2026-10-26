@@ -428,7 +428,11 @@ class KVCacheManager:
             # if we dont , then the recycled block would claim some information
             # is in there, when really that information has changed
             if self.block_hash[b] is not None:
-                self.hash_to_block.pop(self.block_hash[b], None)
+                # only drop the mapping if it points at b. Two blocks can end up
+                # with the same hash (setdefault keeps the first), and evicting
+                # the second must not unlink the first, which is still valid
+                if self.hash_to_block.get(self.block_hash[b]) == b:
+                    del self.hash_to_block[self.block_hash[b]]
                 self.block_hash[b] = None
 
             # give the block to the request
@@ -1135,6 +1139,15 @@ class ModelRunner:
         # other = bytes held by someone else (or untracked)
         peak = torch.cuda.max_memory_allocated()
         free, total = torch.cuda.mem_get_info()
+
+        # GPUs that share system RAM (DGX Spark / GB10, Jetson) count the OS
+        # page cache as used in mem_get_info, even though the kernel gives it
+        # back on demand. MemAvailable from the kernel includes it.
+        if torch.cuda.get_device_properties(0).is_integrated and os.path.exists("/proc/meminfo"):
+            with open("/proc/meminfo") as f:
+                avail = next(int(l.split()[1]) * 1024 for l in f if l.startswith("MemAvailable"))
+            free = max(free, avail)
+
         other = total - free - torch.cuda.memory_reserved()
 
         # Leave (1 - gpu_memory_utilization) headroom, don't steal other,
@@ -1651,11 +1664,7 @@ class AsyncEngine:
                         # e.g. prompt too long. Don't let it kill this thread,
                         # finish the client's stream with an error instead
                         traceback.print_exc()
-                        stream = self.streams.get(rid)
-                        if stream is not None:
-                            loop, q = stream
-                            loop.call_soon_threadsafe(q.put_nowait, Output(
-                                rid, "", "", [], True, "error", 0, 0))
+                        self._send_error(rid)
                 else:
                     # The client disconnected ("abort"). Tell the engine to drop it from GPU memory.
                     self.engine.abort(rid)
@@ -1667,6 +1676,11 @@ class AsyncEngine:
                 outputs = self.engine.step()
             except Exception:
                 traceback.print_exc()
+                # the same batch would just fail again on the next loop, so end
+                # every request in flight with an error instead of retrying forever
+                for rid in list(self.engine.requests):
+                    self.engine.abort(rid)
+                    self._send_error(rid)
                 continue
 
             # route the outputs back to the webserver
@@ -1680,6 +1694,13 @@ class AsyncEngine:
                     # async event loop. asyncio is not threadsafe, so we use call_soon_threadsafe
                     # to safely push the output o into the webservers queue
                     loop.call_soon_threadsafe(q.put_nowait, o)
+
+    def _send_error(self, rid):
+        """Finish a client's stream with finish_reason "error" so it doesn't wait forever."""
+        stream = self.streams.get(rid)
+        if stream is not None:
+            loop, q = stream
+            loop.call_soon_threadsafe(q.put_nowait, Output(rid, "", "", [], True, "error", 0, 0))
 
     async def generate(self, prompt, params: SamplingParams):
         """
