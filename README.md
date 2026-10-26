@@ -30,7 +30,7 @@ With the same weights, prompts and GPU, continuous batching over a paged cache i
 
 ## Setup
 
-Requires Python 3.10+ and an NVIDIA GPU for the engine. The two demos also run on CPU or Apple Silicon.
+Requires Python 3.10+ (tested on 3.12) and an NVIDIA GPU for the engine. `kv-demo`, `kv-manager-demo` and `attn-demo` also run on CPU or Apple Silicon.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -48,6 +48,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cu130
 Without flash-attn, tinyserve falls back to the PyTorch reference attention: 16-token pages, no CUDA graphs, and about 8× slower in our tests. To install it:
 
 ```bash
+pip install ninja packaging psutil einops
 pip install flash-attn --no-build-isolation
 ```
 

@@ -1,13 +1,16 @@
-torch
-numpy
-pandas
-transformers
-huggingface_hub
-safetensors
-datasets
-fastapi
-uvicorn
+# Tested with Python 3.12 on macOS (Apple Silicon) and Ubuntu 24.04 aarch64 (DGX Spark, CUDA 13)
+torch>=2.14.1
+numpy>=2.5.4
+pandas>=3.1.0
+transformers>=5.20.2
+huggingface_hub>=2.3.0
+safetensors>=0.8.0
+datasets>=5.1.0
+fastapi>=0.162.0
+uvicorn>=0.54.0
 
-# Optional: faster attention on CUDA GPUs (falls back to pure torch if missing).
-# Install separately after torch: pip install flash-attn --no-build-isolation
-# flash-attn
+# Optional: faster attention on NVIDIA GPUs (falls back to pure torch if missing).
+# Install separately after torch, see the README:
+#   pip install ninja packaging psutil einops
+#   pip install flash-attn --no-build-isolation
+# flash-attn>=2.8.3
